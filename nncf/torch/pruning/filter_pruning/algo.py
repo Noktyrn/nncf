@@ -665,3 +665,18 @@ class FilterPruningController(BasePruningAlgoController):
         if self._bn_adaptation is None:
             self._bn_adaptation = BatchnormAdaptationAlgorithm(**extract_bn_adaptation_init_params(self.config))
         self._bn_adaptation.run(self.model)
+
+    def get_pruned_filters_dict(self):
+        pruned_filters_by_layer = {}
+
+        for group in self.pruned_module_groups_info.get_all_clusters():
+            pruned_filters = []
+            for minfo in group.elements:
+
+                for i, bit in enumerate(minfo.operand.binary_filter_pruning_mask):
+                    if bit == 0:
+                        pruned_filters.append(i)
+            
+                pruned_filters_by_layer[minfo.node_name] = pruned_filters
+        
+        return pruned_filters_by_layer

@@ -164,10 +164,19 @@ def main_worker(current_gpu, config: SampleConfig):
                        weights_path=config.get('weights'))
 
     model.to(config.device)
+    
+    #MY CODE
+    params_to_optimize = get_parameter_groups(model, config)
+    #config.global_epochs=0
+    reg_optimizer, _ = make_optimizer(params_to_optimize, config)
+    train_reg(config, model, criterion, train_criterion_fn, reg_optimizer, train_loader)
+    #MY CODE ENDS
 
     resuming_model_sd, resuming_checkpoint = load_resuming_checkpoint(resuming_checkpoint_path)
     compression_ctrl, model = create_compressed_model(model, nncf_config,
                                                       resuming_state_dict=resuming_model_sd)
+    print("/n Pruned filters by layer: ")
+    print(compression_ctrl.get_pruned_filters_dict())
 
     if config.to_onnx:
         compression_ctrl.export_model(config.to_onnx)
@@ -179,7 +188,7 @@ def main_worker(current_gpu, config: SampleConfig):
         compression_ctrl.distributed()
 
     # define optimizer
-    params_to_optimize = get_parameter_groups(model, config)
+    #params_to_optimize = get_parameter_groups(model, config)
     optimizer, lr_scheduler = make_optimizer(params_to_optimize, config)
 
     best_acc1 = 0
@@ -241,6 +250,63 @@ def main_worker(current_gpu, config: SampleConfig):
                   train_loader, train_sampler, val_loader, best_acc1)
 
     config.mlflow.end_run()
+
+
+def train_reg(config, model, criterion, criterion_fn, optimizer, train_loader, t_pick=1.0, t_granularity=1e-3, K_u=20):
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    losses = AverageMeter()
+    compression_losses = AverageMeter()
+    criterion_losses = AverageMeter()
+    top1 = AverageMeter()
+    top5 = AverageMeter()
+    config.global_epochs = 0
+    
+    t = 0
+    end = time.time()
+    while t <= t_pick:
+        data_time.update(time.time() - end)
+
+        for i, (input_, target) in enumerate(train_loader):
+            input_ = input_.to(config.device)
+            target = target.to(config.device)
+
+            output = model(input_)
+            loss = criterion_fn(output, target, criterion)
+
+            if isinstance(output, InceptionOutputs):
+                output = output.logits
+            # measure accuracy and record loss
+            acc1, acc5 = accuracy(output, target, topk=(1, 5))
+            losses.update(loss.item(), input_.size(0))
+            compression_losses.update(0, input_.size(0))
+            criterion_losses.update(loss.item(), input_.size(0))
+            top1.update(acc1, input_.size(0))
+            top5.update(acc5, input_.size(0))
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            if i % K_u == 0:
+                t += t_granularity
+                optimizer.weight_decay = t
+            
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            if is_main_process():
+                global_step = len(train_loader) * config.global_epochs
+                config.tb.add_scalar("train/learning_rate", get_lr(optimizer), i + global_step)
+                config.tb.add_scalar("train/criterion_loss", criterion_losses.avg, i + global_step)
+                config.tb.add_scalar("train/compression_loss", compression_losses.avg, i + global_step)
+                config.tb.add_scalar("train/loss", losses.avg, i + global_step)
+                config.tb.add_scalar("train/top1", top1.avg, i + global_step)
+                config.tb.add_scalar("train/top5", top5.avg, i + global_step)
+            
+            if t > t_pick:
+                break
+        config.global_epochs += 1
 
 
 def train(config, compression_ctrl, model, criterion, criterion_fn, lr_scheduler, model_name, optimizer,
@@ -493,7 +559,7 @@ def train_epoch(train_loader, model, criterion, criterion_fn, optimizer, compres
                 ))
 
         if is_main_process():
-            global_step = len(train_loader) * epoch
+            global_step = len(train_loader) * (epoch + config.global_epochs)
             config.tb.add_scalar("train/learning_rate", get_lr(optimizer), i + global_step)
             config.tb.add_scalar("train/criterion_loss", criterion_losses.avg, i + global_step)
             config.tb.add_scalar("train/compression_loss", compression_losses.avg, i + global_step)
