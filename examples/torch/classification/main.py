@@ -164,19 +164,27 @@ def main_worker(current_gpu, config: SampleConfig):
                        weights_path=config.get('weights'))
 
     model.to(config.device)
-    
+
+    resuming_model_sd, resuming_checkpoint = load_resuming_checkpoint(resuming_checkpoint_path)
+
+    #Using compression to find pruned layers
+    compression_ctrl, _ = create_compressed_model(model, nncf_config,
+                                                      resuming_state_dict=resuming_model_sd)
+
+    pruned_filters = compression_ctrl.get_pruned_filters_dict()
+
     #MY CODE
     params_to_optimize = get_parameter_groups(model, config)
     #config.global_epochs=0
     reg_optimizer, _ = make_optimizer(params_to_optimize, config)
-    train_reg(config, model, criterion, train_criterion_fn, reg_optimizer, train_loader)
-    #MY CODE ENDS
-
+    train_greg(config, model, criterion, train_criterion_fn, reg_optimizer, train_loader, pruned_filters)
+    """
     resuming_model_sd, resuming_checkpoint = load_resuming_checkpoint(resuming_checkpoint_path)
+
     compression_ctrl, model = create_compressed_model(model, nncf_config,
                                                       resuming_state_dict=resuming_model_sd)
-    print("/n Pruned filters by layer: ")
-    print(compression_ctrl.get_pruned_filters_dict())
+    """
+    #MY CODE ENDS
 
     if config.to_onnx:
         compression_ctrl.export_model(config.to_onnx)
@@ -251,8 +259,33 @@ def main_worker(current_gpu, config: SampleConfig):
 
     config.mlflow.end_run()
 
+"""
+GReg-1 implementation is here!!!
+"""
+#MY CODE
+def compare_layers(name, param_name):
+    name_tokens = name.split('/')[1:]
+    param_tokens = param_name.split('.')[:-1]
 
-def train_reg(config, model, criterion, criterion_fn, optimizer, train_loader, t_pick=1.0, t_granularity=1e-3, K_u=20):
+    if len(name_tokens[:-1]) != len(param_tokens):
+        return False
+    
+    for i in range(len(name_tokens[:-1])):
+        open_br = name_tokens[i].index('[')
+        cl_br = name_tokens[i].index(']')
+        name_tokens[i] = name_tokens[i][open_br+1:cl_br]
+
+    return set(name_tokens[:-1]) == set(param_tokens)
+
+def get_l2_reg(param, filter_indexes, config):
+    l2_reg = torch.zeros(1).to(config.device)
+    for idx in filter_indexes:
+        for filter in param[idx]:
+            l2_reg += filter.norm(p=2)
+    return l2_reg
+
+def train_greg(config, model, criterion, criterion_fn, optimizer, train_loader, 
+               pruned_filter_indexes, t_pick=1, t_granularity=0.5, K_u=20):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -264,6 +297,16 @@ def train_reg(config, model, criterion, criterion_fn, optimizer, train_loader, t
     
     t = 0
     end = time.time()
+
+    filter_weights = {}
+
+    #The map {pruned filter name to filter weights} is created here
+    for n, p in model.named_parameters():
+        for filter_name in pruned_filter_indexes:
+            if compare_layers(filter_name, n):
+                print("Layer {} equals to {}".format(n, filter_name))
+                filter_weights[filter_name] = p
+
     while t <= t_pick:
         data_time.update(time.time() - end)
 
@@ -272,7 +315,12 @@ def train_reg(config, model, criterion, criterion_fn, optimizer, train_loader, t
             target = target.to(config.device)
 
             output = model(input_)
-            loss = criterion_fn(output, target, criterion)
+
+            l2 = torch.zeros(1).to(config.device)
+            for layer in pruned_filter_indexes:
+                l2 += get_l2_reg(filter_weights[layer], pruned_filter_indexes[layer], config)
+            
+            loss = criterion_fn(output, target, criterion) + t*l2
 
             if isinstance(output, InceptionOutputs):
                 output = output.logits
@@ -290,7 +338,6 @@ def train_reg(config, model, criterion, criterion_fn, optimizer, train_loader, t
             
             if i % K_u == 0:
                 t += t_granularity
-                optimizer.weight_decay = t
             
             batch_time.update(time.time() - end)
             end = time.time()
@@ -307,7 +354,7 @@ def train_reg(config, model, criterion, criterion_fn, optimizer, train_loader, t
             if t > t_pick:
                 break
         config.global_epochs += 1
-
+#MY CODE ENDS
 
 def train(config, compression_ctrl, model, criterion, criterion_fn, lr_scheduler, model_name, optimizer,
           train_loader, train_sampler, val_loader, best_acc1=0):

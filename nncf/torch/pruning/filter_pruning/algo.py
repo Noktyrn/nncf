@@ -670,13 +670,10 @@ class FilterPruningController(BasePruningAlgoController):
         pruned_filters_by_layer = {}
 
         for group in self.pruned_module_groups_info.get_all_clusters():
-            pruned_filters = []
             for minfo in group.elements:
-
-                for i, bit in enumerate(minfo.operand.binary_filter_pruning_mask):
-                    if bit == 0:
-                        pruned_filters.append(i)
-            
-                pruned_filters_by_layer[minfo.node_name] = pruned_filters
+                pruned_filters_by_layer[minfo.node_name] = []
+                for i in range(len(minfo.operand.binary_filter_pruning_mask)):
+                    if minfo.operand.binary_filter_pruning_mask[i] == 0:
+                        pruned_filters_by_layer[minfo.node_name].append(i)
         
         return pruned_filters_by_layer
