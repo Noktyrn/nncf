@@ -167,9 +167,12 @@ def main_worker(current_gpu, config: SampleConfig):
 
     resuming_model_sd, resuming_checkpoint = load_resuming_checkpoint(resuming_checkpoint_path)
 
+    model_temp = deepcopy(model)
     #Using compression to find pruned layers
-    compression_ctrl, _ = create_compressed_model(model, nncf_config,
+    compression_ctrl, _ = create_compressed_model(model_temp, nncf_config,
                                                       resuming_state_dict=resuming_model_sd)
+
+    print(model)
 
     pruned_filters = compression_ctrl.get_pruned_filters_dict()
 
@@ -178,12 +181,13 @@ def main_worker(current_gpu, config: SampleConfig):
     #config.global_epochs=0
     reg_optimizer, _ = make_optimizer(params_to_optimize, config)
     train_greg(config, model, criterion, train_criterion_fn, reg_optimizer, train_loader, pruned_filters)
-    """
     resuming_model_sd, resuming_checkpoint = load_resuming_checkpoint(resuming_checkpoint_path)
 
     compression_ctrl, model = create_compressed_model(model, nncf_config,
                                                       resuming_state_dict=resuming_model_sd)
-    """
+    if compare_pruning_dicts(compression_ctrl.get_pruned_filters_dict(), pruned_filters):
+        print("Different set of filters war chosen to be pruned, aborting")
+        exit()
     #MY CODE ENDS
 
     if config.to_onnx:
@@ -263,6 +267,10 @@ def main_worker(current_gpu, config: SampleConfig):
 GReg-1 implementation is here!!!
 """
 #MY CODE
+def compare_pruning_dicts(pd1, pd2):
+    shared_items = {pd1[k] for k in pd1 if k in pd2 and pd2[k]==pd1[k]}
+    return len(shared_items) == len(pd1) and len(shared_items) == len(pd2)
+
 def compare_layers(name, param_name):
     name_tokens = name.split('/')[1:]
     param_tokens = param_name.split('.')[:-1]
@@ -282,10 +290,11 @@ def get_l2_reg(param, filter_indexes, config):
     for idx in filter_indexes:
         for filter in param[idx]:
             l2_reg += filter.norm(p=2)
+
     return l2_reg
 
 def train_greg(config, model, criterion, criterion_fn, optimizer, train_loader, 
-               pruned_filter_indexes, t_pick=1, t_granularity=0.5, K_u=20):
+               pruned_filter_indexes, t_pick=1, t_granularity=1e-4, K_u=10):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
