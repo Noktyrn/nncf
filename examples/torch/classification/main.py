@@ -289,8 +289,7 @@ def get_all_pruned_weights(filter_indexes, filter_weights):
 
     for layer in filter_indexes:
         for channel_idx in filter_indexes[layer]:
-            for filter_idx in range(filter_weights[layer][channel_idx].size(0)):
-                weights.append([layer, channel_idx, filter_idx])
+            weights.append([layer, channel_idx])
 
     return weights
 
@@ -329,7 +328,7 @@ def train_greg(config, model, criterion, criterion_fn, optimizer, train_loader,
             output = model(input_)
 
             #get the value of l2 reg
-            l2 = reduce((lambda x, y: x + filter_weights[y[0]][y[1]][y[2]].norm(p=2)), 
+            l2 = reduce((lambda x, y: x + filter_weights[y[0]][y[1]].norm(p=2)), 
                          weights, torch.zeros(1).to(config.device))
             
             print(l2)
