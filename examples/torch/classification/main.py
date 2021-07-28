@@ -28,7 +28,7 @@ import torchvision.datasets as datasets
 import torchvision.models as models
 import torchvision.transforms as transforms
 import warnings
-from functools import partial
+from functools import partial, reduce
 from shutil import copyfile
 from torch.nn.modules.loss import _Loss
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -172,8 +172,6 @@ def main_worker(current_gpu, config: SampleConfig):
     compression_ctrl, _ = create_compressed_model(model_temp, nncf_config,
                                                       resuming_state_dict=resuming_model_sd)
 
-    print(model)
-
     pruned_filters = compression_ctrl.get_pruned_filters_dict()
 
     #MY CODE
@@ -285,16 +283,19 @@ def compare_layers(name, param_name):
 
     return set(name_tokens[:-1]) == set(param_tokens)
 
-def get_l2_reg(param, filter_indexes, config):
-    l2_reg = torch.zeros(1).to(config.device)
-    for idx in filter_indexes:
-        for filter in param[idx]:
-            l2_reg += filter.norm(p=2)
+#Returns list of tuples, each one of which contains the layer, channel and index of the corresponding filter
+def get_all_pruned_weights(filter_indexes, filter_weights):
+    weights = []
 
-    return l2_reg
+    for layer in filter_indexes:
+        for channel_idx in filter_indexes[layer]:
+            for filter_idx in range(filter_weights[layer][channel_idx].size(0)):
+                weights.append([layer, channel_idx, filter_idx])
+
+    return weights
 
 def train_greg(config, model, criterion, criterion_fn, optimizer, train_loader, 
-               pruned_filter_indexes, t_pick=1, t_granularity=1e-4, K_u=10):
+               pruned_filter_indexes, t_pick=1, t_granularity=1e-3, K_u=10):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -308,13 +309,15 @@ def train_greg(config, model, criterion, criterion_fn, optimizer, train_loader,
     end = time.time()
 
     filter_weights = {}
-
+    
     #The map {pruned filter name to filter weights} is created here
     for n, p in model.named_parameters():
         for filter_name in pruned_filter_indexes:
             if compare_layers(filter_name, n):
                 print("Layer {} equals to {}".format(n, filter_name))
                 filter_weights[filter_name] = p
+
+    weights = get_all_pruned_weights(pruned_filter_indexes, filter_weights)
 
     while t <= t_pick:
         data_time.update(time.time() - end)
@@ -325,9 +328,14 @@ def train_greg(config, model, criterion, criterion_fn, optimizer, train_loader,
 
             output = model(input_)
 
-            l2 = torch.zeros(1).to(config.device)
-            for layer in pruned_filter_indexes:
-                l2 += get_l2_reg(filter_weights[layer], pruned_filter_indexes[layer], config)
+            #get the value of l2 reg
+            l2 = reduce((lambda x, y: x + filter_weights[y[0]][y[1]][y[2]].norm(p=2)), 
+                         weights, torch.zeros(1).to(config.device))
+            
+            print(l2)
+
+            #for l, ch, idx in weights:
+                #l2 += filter_weights[l][ch][idx].norm(p=2)
             
             loss = criterion_fn(output, target, criterion) + t*l2
 
@@ -350,7 +358,7 @@ def train_greg(config, model, criterion, criterion_fn, optimizer, train_loader,
             
             batch_time.update(time.time() - end)
             end = time.time()
-
+            
             if is_main_process():
                 global_step = len(train_loader) * config.global_epochs
                 config.tb.add_scalar("train/learning_rate", get_lr(optimizer), i + global_step)
