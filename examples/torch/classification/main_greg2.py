@@ -178,23 +178,24 @@ def main_worker(current_gpu, config: SampleConfig):
 
     resuming_model_sd, resuming_checkpoint = load_resuming_checkpoint(resuming_checkpoint_path)
 
-    model_temp = deepcopy(model)
-    #Using compression to find pruned layers
-    compression_ctrl, _ = create_compressed_model(model_temp, nncf_config,
-                                                      resuming_state_dict=resuming_model_sd)
-
-    pruned_filters = compression_ctrl.get_pruned_filters_dict()
-
     #MY CODE
     params_to_optimize = get_parameter_groups(model, config)
     config.global_epochs=0
+
     reg_optimizer, _ = make_optimizer(params_to_optimize, config)
-    train_greg1(config, model, criterion, train_criterion_fn, reg_optimizer, train_loader, pruned_filters)
+
+    #Here we apply growing reg to all weights
+    train_grow_reg(config, model, criterion, train_criterion_fn, reg_optimizer, train_loader)
     resuming_model_sd, resuming_checkpoint = load_resuming_checkpoint(resuming_checkpoint_path)
-
-    compression_ctrl, model = create_compressed_model(model, nncf_config,
+    
+    #Here we get which filters will be pruned
+    model_s = deepcopy(model)
+    compression_ctrl, model_s = create_compressed_model(model_s, nncf_config,
                                                       resuming_state_dict=resuming_model_sd)
+    
+    pruned_filters = compression_ctrl.get_pruned_filters_dict()
 
+    train_greg1(config, model, criterion, train_criterion_fn, reg_optimizer, train_loader, pruned_filters)
     #MY CODE ENDS
 
     if config.to_onnx:
@@ -327,8 +328,74 @@ def get_l2_reg(filter_weights, weights, config):
             
     return l2
 
+def train_grow_reg(config, model, criterion, criterion_fn, optimizer, train_loader, t_pick=1e-2, t_granularity=1e-5, K_u=10):
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    losses = AverageMeter()
+    compression_losses = AverageMeter()
+    criterion_losses = AverageMeter()
+    top1 = AverageMeter()
+    top5 = AverageMeter()
+    
+    t = 0
+    end = time.time()
+    while t <= t_pick:
+        data_time.update(time.time() - end)
+
+        for i, (input_, target) in enumerate(train_loader):
+            input_ = input_.to(config.device)
+            target = target.to(config.device)
+
+            output = model(input_)
+            loss = criterion_fn(output, target, criterion)
+
+            if isinstance(output, InceptionOutputs):
+                output = output.logits
+            # measure accuracy and record loss
+            acc1, acc5 = accuracy(output, target, topk=(1, 5))
+            losses.update(loss.item(), input_.size(0))
+            compression_losses.update(0, input_.size(0))
+            criterion_losses.update(loss.item(), input_.size(0))
+            top1.update(acc1, input_.size(0))
+            top5.update(acc5, input_.size(0))
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            if i % K_u == 0:
+                t += t_granularity
+                optimizer.weight_decay = t
+            
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            if is_main_process():
+                global_step = len(train_loader) * config.global_epochs
+                config.tb.add_scalar("train/learning_rate", get_lr(optimizer), i + global_step)
+                config.tb.add_scalar("train/criterion_loss", criterion_losses.avg, i + global_step)
+                config.tb.add_scalar("train/compression_loss", compression_losses.avg, i + global_step)
+                config.tb.add_scalar("train/loss", losses.avg, i + global_step)
+                config.tb.add_scalar("train/top1", top1.avg, i + global_step)
+                config.tb.add_scalar("train/top5", top5.avg, i + global_step)
+            
+            if t > t_pick:
+                break
+        config.global_epochs += 1
+
+        checkpoint_path = osp.join(config.checkpoint_save_dir, get_name(config) + '_all_grow.pth')
+        checkpoint = {
+            'epoch': config.global_epochs,
+            'arch': "unknown",
+            'state_dict': model.state_dict(),
+            'best_acc1': top1,
+            'acc1': acc1,
+            'optimizer': optimizer.state_dict()
+        }
+        torch.save(checkpoint, checkpoint_path)
+
 def train_greg1(config, model, criterion, criterion_fn, optimizer, train_loader, 
-               pruned_filter_indexes, t_pick=1, t_granularity=1e-3, K_u=10):
+               pruned_filter_indexes, t_pick=1, t_granularity=1e-4, K_u=10):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -397,8 +464,8 @@ def train_greg1(config, model, criterion, criterion_fn, optimizer, train_loader,
             if t > t_pick:
                 break
         config.global_epochs += 1
-        """
-        checkpoint_path = osp.join(config.checkpoint_save_dir, get_name(config) + '_pretune.pth')
+
+        checkpoint_path = osp.join(config.checkpoint_save_dir, get_name(config) + '_after_greg1.pth')
         checkpoint = {
             'epoch': config.global_epochs,
             'arch': "unknown",
@@ -409,7 +476,6 @@ def train_greg1(config, model, criterion, criterion_fn, optimizer, train_loader,
             'weights_to_prune': pruned_filter_indexes
         }
         torch.save(checkpoint, checkpoint_path)
-        """
        
 #MY CODE ENDS
 

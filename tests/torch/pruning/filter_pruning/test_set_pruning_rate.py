@@ -19,7 +19,9 @@ from tests.torch.helpers import create_compressed_model_and_algo_for_test
 from tests.torch.helpers import check_correct_nncf_modules_replacement
 from tests.torch.pruning.helpers import get_basic_pruning_config
 from tests.torch.pruning.helpers import BigPruningTestModel
-
+#MY IMPORTS
+from examples.torch.classification.main import get_l2_reg, get_filter_weigths, get_all_pruned_weights
+#END
 
 def create_pruning_algo_with_config(config):
     """
@@ -61,6 +63,28 @@ def test_setting_pruning_rate(all_weights, pruning_rate_to_set, ref_pruning_rate
     assert np.isclose(groupwise_pruning_rates, ref_pruning_rates).all()
     assert np.isclose(pruning_controller.pruning_rate, ref_global_pruning_rate).all()
 
+#MY CODE
+def test_setting_pruning_rate_greg1(all_weights, pruning_rate_to_set, ref_pruning_rates, ref_global_pruning_rate):
+    """
+    Test setting global and groupwise pruning rates via the set_pruning_rate method.
+    """
+    # Creating algorithm with empty config
+    config = get_basic_pruning_config(input_sample_size=[1, 1, 8, 8])
+    config['compression']['pruning_init'] = 0.2
+    config['compression']['params']['all_weights'] = all_weights
+
+    model, pruning_controller, _ = create_pruning_algo_with_config(config)
+    assert isinstance(pruning_controller, FilterPruningController)
+
+    pruned_filters = pruning_controller.get_pruned_filters_dict()
+    filter_weights = get_filter_weigths(model, pruned_filters)
+    weights = get_all_pruned_weights(pruned_filters)
+
+    pruning_controller.set_pruning_rate(pruning_rate_to_set)
+    groupwise_pruning_rates = list(pruning_controller.current_groupwise_pruning_rate.values())
+    assert np.isclose(groupwise_pruning_rates, ref_pruning_rates).all()
+    assert np.isclose(pruning_controller.pruning_rate, ref_global_pruning_rate).all()
+#MY CODE ENDS
 
 def test_can_set_compression_rate_in_filter_pruning_algo():
     """
