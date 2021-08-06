@@ -3,7 +3,8 @@ from main import AverageMeter, compare_layers
 import matplotlib.pyplot as plt
 from functools import reduce
 
-m_dict = torch.load("/home/tagir/work/nncf/examples/result/pruning/experiments/resnet50/pretune_only/ResNet50_cifar_cifar100_filter_pruning/2021-08-02__16-40-16/ResNet50_cifar_cifar100_filter_pruning_pretune.pth")
+m_dict = torch.load("/home/tagir/work/nncf/examples/result/pruning/experiments/resnet18/greg2_negative_coef/ResNet18_cifar_cifar100_filter_pruning/2021-08-06__10-38-03/ResNet18_cifar_cifar100_filter_pruning_after_greg1.pth")
+"""
 res = []
 
 pruned_layers = m_dict['weights_to_prune'].keys()
@@ -19,6 +20,9 @@ for layer in m_dict['state_dict'].keys():
 
 print(left_layers)
 print(len(res))
+"""
+plt.plot(m_dict['l2_k_log'])
+plt.savefig('l2_neg_resnet18_kept.png')
 
-plt.plot(res)
-plt.savefig('l2_test_resnet50.png')
+plt.plot(m_dict['l2_p_log'])
+plt.savefig('l2_neg_resnet18_prun.png')
