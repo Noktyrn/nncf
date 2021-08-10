@@ -448,7 +448,7 @@ def train_step2(config, model, criterion, criterion_fn, optimizer, train_loader,
                             torch.zeros(1).to(config.device))
 
             l2_k_log.append(l2_k)
-            print("Pruned L2: {}, Kept L2: {}".format(l2_p_log, l2_k_log))
+            print("Pruned L2: {}, Kept L2: {}".format(l2_p, l2_k))
 
             loss = criterion_fn(output, target, criterion) + t*l2_p + l_neg*l2_k
 
