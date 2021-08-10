@@ -674,6 +674,8 @@ class FilterPruningController(BasePruningAlgoController):
                 pruned_filters_by_layer[minfo.node_name] = []
                 for i in range(len(minfo.operand.binary_filter_pruning_mask)):
                     if minfo.operand.binary_filter_pruning_mask[i] == 0:
-                        pruned_filters_by_layer[minfo.node_name].append(i)
-        
+                        pruned_filters_by_layer[minfo.node_name].append(False)
+                    else:
+                        pruned_filters_by_layer[minfo.node_name].append(True)
+                    
         return pruned_filters_by_layer
