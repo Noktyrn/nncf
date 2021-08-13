@@ -1,5 +1,5 @@
 {
-    "model": "ResNet50_cifar",
+    "model": "vgg19",
     "pretrained": true,
     "batch_size" : 128,
     "epochs": 120,
@@ -8,7 +8,7 @@
     },
     "optimizer": {
         "type": "SGD",
-        "base_lr": 0.1,
+        "base_lr": 1e-2,
         "weight_decay": 5e-4,
         "schedule_type": "multistep",
         "steps": [
@@ -21,16 +21,14 @@
             "nesterov": true
         }
     },
-    "compression": [
-        {
+   "compression": [
+       {
             "algorithm": "filter_pruning",
-            "pruning_init": 0.1,
-             "params": {
-                 "schedule": "exponential",
+            "pruning_init": 0.7,
+            "params": {
                  "pruning_target": 0.7,
-                 "pruning_steps": 15,
                  "weight_importance": "L2"
              }
-         }
-    ]
+        }
+   ]
 }

@@ -4,8 +4,8 @@ import matplotlib.pyplot as plt
 from functools import reduce
 
 x = torch.rand(4,2,2,2)
-print(x[[False,True,False,True]])
-print(x[[False,True,False,True]].flatten(0))
+print(x)
+print(x[[False,True,False,True]].flatten(1))
 """
 m_dict = torch.load("/home/tagir/work/nncf/examples/result/pruning/experiments/resnet18/greg2_negative_coef/model/ResNet18_cifar_cifar100_filter_pruning_after_greg1.pth",
 map_location=torch.device('cpu'))

@@ -412,7 +412,7 @@ def train_grow_reg(config, model, criterion, criterion_fn, optimizer, train_load
 
 
 def train_step2(config, model, criterion, criterion_fn, optimizer, train_loader, 
-               pruned_filter_indexes, t_start=0, t_pick=1, t_granularity=1e-3, K_u=10):
+               pruned_filter_indexes, t_start=0, t_pick=0.1, t_granularity=1e-4, K_u=10):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
