@@ -475,7 +475,7 @@ def train(config, compression_ctrl, model, criterion, criterion_fn, lr_scheduler
 
 
 def get_dataset(dataset_config, config, transform, is_train):
-    if dataset_config == 'imagenet':
+    if dataset_config == 'imagenet' or dataset_config:
         prefix = 'train' if is_train else 'val'
         return datasets.ImageFolder(osp.join(config.dataset_dir, prefix), transform)
     # For testing purposes
@@ -500,10 +500,10 @@ def create_cifar(config, dataset_config, is_train, transform):
 def create_datasets(config):
     dataset_config = config.dataset if config.dataset is not None else 'imagenet'
     dataset_config = dataset_config.lower()
-    assert dataset_config in ['imagenet', 'cifar100', 'cifar10', 'mock_32x32', 'mock_299x299'], \
+    assert dataset_config in ['tiny_imagenet', 'imagenet', 'cifar100', 'cifar10', 'mock_32x32', 'mock_299x299'], \
         "Unknown dataset option"
 
-    if dataset_config == 'imagenet':
+    if dataset_config == 'imagenet' or dataset_config == 'tiny_imagenet':
         normalize = transforms.Normalize(mean=(0.485, 0.456, 0.406),
                                          std=(0.229, 0.224, 0.225))
     elif dataset_config == 'cifar100':

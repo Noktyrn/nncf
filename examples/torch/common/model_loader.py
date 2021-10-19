@@ -22,7 +22,8 @@ import examples.torch.common.restricted_pickle_module as restricted_pickle_modul
 from nncf.torch.checkpoint_loading import load_state
 from nncf.torch.utils import safe_thread_call
 from examples.torch.classification.models.mobilenet_v2_32x32 import MobileNetV2For32x32
-
+from examples.torch.classification.models.googlenet import GoogleNet
+from examples.torch.classification.models.vgg19_tiny import vgg19_tiny
 
 def load_model(model, pretrained=True, num_classes=1000, model_params=None,
                weights_path: str = None) -> torch.nn.Module:
@@ -42,8 +43,12 @@ def load_model(model, pretrained=True, num_classes=1000, model_params=None,
     elif model in custom_models.__dict__:
         load_model_fn = partial(custom_models.__dict__[model], num_classes=num_classes, pretrained=pretrained,
                                 **model_params)
+    elif model == 'vgg19_tiny':
+        load_model_fn = partial(vgg19_tiny, num_classes=200)
     elif model == "mobilenet_v2_32x32":
         load_model_fn = partial(MobileNetV2For32x32, num_classes=100)
+    elif model == "googlenet_cifar":
+        load_model_fn = partial(GoogleNet)
     else:
         raise Exception("Undefined model name")
     loaded_model = safe_thread_call(load_model_fn)
