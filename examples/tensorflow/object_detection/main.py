@@ -18,13 +18,15 @@ from pathlib import Path
 import tensorflow as tf
 import numpy as np
 
-from nncf.tensorflow import AdaptiveCompressionTrainingLoop
+from nncf.common.accuracy_aware_training import create_accuracy_aware_training_loop
 from nncf.tensorflow import create_compressed_model
 from nncf.tensorflow.helpers.model_manager import TFOriginalModelManager
 from nncf.tensorflow.initialization import register_default_init_args
 from nncf.common.utils.tensorboard import prepare_for_tensorboard
 from nncf.config.utils import is_accuracy_aware_training
 from nncf.config.structures import ModelEvaluationArgs
+from nncf.tensorflow.utils.state import TFCompressionState
+from nncf.tensorflow.utils.state import TFCompressionStateLoader
 
 from examples.tensorflow.common.argparser import get_common_argument_parser
 from examples.tensorflow.common.distributed import get_distribution_strategy
@@ -35,7 +37,9 @@ from examples.tensorflow.common.sample_config import create_sample_config
 from examples.tensorflow.common.scheduler import build_scheduler
 from examples.tensorflow.common.utils import SummaryWriter
 from examples.tensorflow.common.utils import Timer
+from examples.tensorflow.common.utils import print_args
 from examples.tensorflow.common.utils import serialize_config
+from examples.tensorflow.common.utils import serialize_cli_args
 from examples.tensorflow.common.utils import create_code_snapshot
 from examples.tensorflow.common.utils import configure_paths
 from examples.tensorflow.common.utils import get_saving_parameters
@@ -47,15 +51,6 @@ from examples.tensorflow.object_detection.models.model_selector import get_model
 def get_argument_parser():
     parser = get_common_argument_parser(precision=False,
                                         save_checkpoint_freq=False)
-
-    parser.add_argument(
-        '--mode',
-        '-m',
-        nargs='+',
-        choices=['train', 'test', 'export'],
-        default='train',
-        help='train: performs training and validation; test: tests the model; export: exports the model.'
-    )
 
     parser.add_argument('--backbone-checkpoint',
                         default=None,
@@ -118,6 +113,12 @@ def resume_from_checkpoint(checkpoint_manager, ckpt_path, steps_per_epoch):
 
     logger.info('Resuming from epoch %d (global step %d)', initial_epoch, initial_step)
     return initial_epoch, initial_step
+
+
+def load_compression_state(ckpt_path: str):
+    checkpoint = tf.train.Checkpoint(compression_state=TFCompressionStateLoader())
+    load_checkpoint(checkpoint, ckpt_path)
+    return checkpoint.compression_state.state
 
 
 def create_test_step_fn(strategy, model, predict_post_process_fn):
@@ -208,6 +209,9 @@ def train(train_step, test_step, eval_metric, train_dist_dataset, test_dist_data
     timer = Timer()
     timer.tic()
 
+    statistics = compression_ctrl.statistics()
+    logger.info(statistics.to_str())
+
     logger.info('Training...')
     for epoch in range(initial_epoch, epochs):
         logger.info('Epoch: {}/{}'.format(epoch, epochs))
@@ -268,10 +272,9 @@ def run(config):
         write_metrics(0, config.metrics_dump)
 
     # Create dataset
-    builders = get_dataset_builders(config, strategy.num_replicas_in_sync)
-    datasets = [builder.build() for builder in builders]
-    train_builder, test_builder = builders
-    train_dataset, test_dataset = datasets
+    train_builder, test_builder = get_dataset_builders(config, strategy.num_replicas_in_sync)
+    train_dataset = train_builder.build()
+    test_dataset = test_builder.build()
     train_dist_dataset = strategy.experimental_distribute_dataset(train_dataset)
     test_dist_dataset = strategy.experimental_distribute_dataset(test_dataset)
 
@@ -297,13 +300,15 @@ def run(config):
 
     resume_training = config.ckpt_path is not None
 
+    compression_state = None
+    if resume_training:
+        compression_state = load_compression_state(config.ckpt_path)
+
     with TFOriginalModelManager(model_builder.build_model,
                                 weights=config.get('weights', None)) as model:
         with strategy.scope():
             config.nncf_config.register_extra_structs([ModelEvaluationArgs(eval_fn=model_eval_fn)])
-            compression_ctrl, compress_model = create_compressed_model(model,
-                                                                       nncf_config,
-                                                                       should_init=not resume_training)
+            compression_ctrl, compress_model = create_compressed_model(model, nncf_config, compression_state)
             scheduler = build_scheduler(
                 config=config,
                 steps_per_epoch=steps_per_epoch)
@@ -318,7 +323,7 @@ def run(config):
 
             checkpoint = tf.train.Checkpoint(model=compress_model,
                                              optimizer=optimizer,
-                                             compression_ctrl=compression_ctrl)
+                                             compression_state=TFCompressionState(compression_ctrl))
             checkpoint_manager = tf.train.CheckpointManager(checkpoint, config.checkpoint_save_dir, max_to_keep=None)
 
             initial_epoch = initial_step = 0
@@ -336,26 +341,24 @@ def run(config):
             timer = Timer()
             timer.tic()
 
-            def train_epoch_fn(compression_ctrl, model, epoch):
+            def train_epoch_fn(compression_ctrl, model, epoch, **kwargs):
                 train_step = create_train_step_fn(strategy, model, loss_fn, optimizer)
                 train_epoch(train_step, compression_ctrl, epoch, initial_epoch, steps_per_epoch,
                             optimizer, checkpoint_manager, train_dist_dataset, train_summary_writer,
                             initial_step, config.print_freq, timer)
 
-            def validate_fn(model, epoch):
+            def validate_fn(model, **kwargs):
                 test_step = create_test_step_fn(strategy, model, predict_post_process_fn)
                 metric_result = evaluate(test_step, eval_metric, test_dist_dataset,
                                          num_test_batches, config.print_freq)
                 return metric_result['AP']
 
-            # instantiate and run accuracy-aware training loop
-            acc_aware_training_loop = AdaptiveCompressionTrainingLoop(config.nncf_config, compression_ctrl)
+            acc_aware_training_loop = create_accuracy_aware_training_loop(nncf_config, compression_ctrl)
             compress_model = acc_aware_training_loop.run(compress_model,
                                                          train_epoch_fn=train_epoch_fn,
                                                          validate_fn=validate_fn,
                                                          tensorboard_writer=config.tb,
                                                          log_dir=config.log_dir)
-
         else:
             train(train_step, test_step, eval_metric, train_dist_dataset, test_dist_dataset,
                   initial_epoch, initial_step, epochs, steps_per_epoch, checkpoint_manager,
@@ -379,12 +382,15 @@ def export(config):
     model_builder = get_model_builder(config)
     model = model_builder.build_model(weights=config.get('weights', None))
 
-    compression_ctrl, compress_model = create_compressed_model(model,
-                                                               config.nncf_config,
-                                                               should_init=False)
+    compression_state = None
+    if config.ckpt_path:
+        compression_state = load_compression_state(config.ckpt_path)
+
+    compression_ctrl, compress_model = create_compressed_model(model, config.nncf_config, compression_state)
 
     if config.ckpt_path:
-        checkpoint = tf.train.Checkpoint(model=compress_model)
+        checkpoint = tf.train.Checkpoint(model=compress_model,
+                                         compression_state=TFCompressionState(compression_ctrl))
         load_checkpoint(checkpoint, config.ckpt_path)
 
     save_path, save_format = get_saving_parameters(config)
@@ -395,8 +401,10 @@ def export(config):
 def main(argv):
     parser = get_argument_parser()
     config = get_config_from_argv(argv, parser)
+    print_args(config)
 
-    serialize_config(config, config.log_dir)
+    serialize_config(config.nncf_config, config.log_dir)
+    serialize_cli_args(parser, argv, config.log_dir)
 
     nncf_root = Path(__file__).absolute().parents[3]
     create_code_snapshot(nncf_root, os.path.join(config.log_dir, "snapshot.tar.gz"))

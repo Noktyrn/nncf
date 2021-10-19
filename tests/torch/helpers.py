@@ -11,42 +11,38 @@
  limitations under the License.
 """
 from abc import ABC, abstractmethod
-from typing import Dict
-from typing import Callable
-from typing import Any
-from typing import Union
-from typing import List
-from typing import Tuple
-from typing import TypeVar
+from copy import deepcopy
+from typing import Dict, Callable, Any, Union, List, Tuple
 import contextlib
 
-import onnx
+import numbers
 import numpy as np
+import onnx
 import torch
-
-from copy import deepcopy
 from onnx import numpy_helper
 from torch import nn
-from torch.nn import functional as F
 from torch.nn import Module
+from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 
-from nncf.config.structures import BNAdaptationInitArgs
-from nncf.torch.composite_compression import PTCompositeCompressionAlgorithmBuilder
-from nncf.torch.compression_method_api import PTCompressionAlgorithmController
 from nncf.config import NNCFConfig
-from nncf.torch.dynamic_graph.scope import Scope
+from nncf.config.extractors import extract_algorithm_names
+from nncf.config.structures import BNAdaptationInitArgs
+from nncf.torch.algo_selector import PT_COMPRESSION_ALGORITHMS
+from nncf.torch.compression_method_api import PTCompressionAlgorithmController
 from nncf.torch.dynamic_graph.graph_tracer import create_input_infos
+from nncf.torch.dynamic_graph.scope import Scope
+from nncf.torch.initialization import PTInitializingDataLoader
 from nncf.torch.initialization import register_default_init_args
 from nncf.torch.layers import NNCF_MODULES_MAP
 from nncf.torch.model_creation import create_compressed_model
 from nncf.torch.nncf_network import NNCFNetwork
 from nncf.torch.utils import get_all_modules_by_type
-from nncf.torch.initialization import PTInitializingDataLoader
 from tests.common.command import Command as BaseCommand
+from tests.common.helpers import BaseTensorListComparator
 
-TensorType = TypeVar('TensorType', bound=Union[torch.Tensor, np.ndarray])
+TensorType = Union[torch.Tensor, np.ndarray, numbers.Number]
 
 
 def fill_conv_weight(conv, value):
@@ -195,7 +191,7 @@ class LeNet(nn.Module):
 
 
 def get_empty_config(model_size=4, input_sample_sizes: Union[Tuple[List[int]], List[int]] = None,
-                     input_info: Dict = None):
+                     input_info: Dict = None) -> NNCFConfig:
     if input_sample_sizes is None:
         input_sample_sizes = [1, 1, 4, 4]
 
@@ -217,61 +213,34 @@ def get_grads(variables: List[nn.Parameter]) -> List[torch.Tensor]:
     return [var.grad.clone() for var in variables]
 
 
-def to_numpy(tensor: TensorType) -> np.ndarray:
-    if isinstance(tensor, torch.Tensor):
-        return tensor.cpu().detach().numpy()
-    return tensor
+class PTTensorListComparator(BaseTensorListComparator):
+    @classmethod
+    def _to_numpy(cls, tensor: TensorType) -> Union[np.ndarray, numbers.Number]:
+        if isinstance(tensor, torch.Tensor):
+            return tensor.cpu().detach().numpy()
+        if isinstance(tensor, (np.ndarray, numbers.Number)):
+            return tensor
+        raise Exception(f'Tensor must be np.ndarray or torch.Tensor, not {type(tensor)}')
 
 
-def compare_tensor_lists(test: List[TensorType], reference: List[TensorType],
-                         assert_fn: Callable[[np.ndarray, np.ndarray], bool]):
-    assert len(test) == len(reference)
-
-    for x, y in zip(test, reference):
-        x = to_numpy(x)
-        y = to_numpy(y)
-        assert_fn(x, y)
-
-
-def check_equal(test: List[TensorType], reference: List[TensorType], rtol: float = 1e-1):
-    compare_tensor_lists(test, reference,
-                         lambda x, y: np.testing.assert_allclose(x, y, rtol=rtol))
-
-
-def check_not_equal(test: List[TensorType], reference: List[TensorType], rtol: float = 1e-4):
-    compare_tensor_lists(test, reference,
-                         lambda x, y: np.testing.assert_raises(AssertionError,
-                                                               np.testing.assert_allclose, x, y, rtol=rtol))
-
-
-def check_less(test: List[TensorType], reference: List[TensorType], rtol=1e-4):
-    check_not_equal(test, reference, rtol=rtol)
-    compare_tensor_lists(test, reference, np.testing.assert_array_less)
-
-
-def check_greater(test: List[TensorType], reference: List[TensorType], rtol=1e-4):
-    check_not_equal(test, reference, rtol=rtol)
-    compare_tensor_lists(test, reference,
-                         lambda x, y: np.testing.assert_raises(AssertionError, np.testing.assert_array_less, x, y))
-
-
-def create_compressed_model_and_algo_for_test(model: Module, config: NNCFConfig,
+def create_compressed_model_and_algo_for_test(model: Module, config: NNCFConfig=None,
                                               dummy_forward_fn: Callable[[Module], Any] = None,
                                               wrap_inputs_fn: Callable[[Tuple, Dict], Tuple[Tuple, Dict]] = None,
-                                              resuming_state_dict: dict = None) \
+                                              compression_state: Dict[str, Any] = None) \
         -> Tuple[NNCFNetwork, PTCompressionAlgorithmController]:
-    assert isinstance(config, NNCFConfig)
-    NNCFConfig.validate(config)
+    if config is not None:
+        assert isinstance(config, NNCFConfig)
+        NNCFConfig.validate(config)
     algo, model = create_compressed_model(model, config, dump_graphs=False, dummy_forward_fn=dummy_forward_fn,
                                           wrap_inputs_fn=wrap_inputs_fn,
-                                          resuming_state_dict=resuming_state_dict)
+                                          compression_state=compression_state)
     return model, algo
 
 
-def create_nncf_model_and_algo_builder(model: Module, config: NNCFConfig,
-                                       dummy_forward_fn: Callable[[Module], Any] = None,
-                                       wrap_inputs_fn: Callable[[Tuple, Dict], Tuple[Tuple, Dict]] = None,
-                                       resuming_state_dict: dict = None):
+def create_nncf_model_and_single_algo_builder(model: Module, config: NNCFConfig,
+                                              dummy_forward_fn: Callable[[Module], Any] = None,
+                                              wrap_inputs_fn: Callable[[Tuple, Dict], Tuple[Tuple, Dict]] = None) \
+        -> Tuple[NNCFNetwork, PTCompressionAlgorithmController]:
     assert isinstance(config, NNCFConfig)
     NNCFConfig.validate(config)
     input_info_list = create_input_infos(config)
@@ -286,9 +255,12 @@ def create_nncf_model_and_algo_builder(model: Module, config: NNCFConfig,
                                    target_scopes=target_scopes,
                                    scopes_without_shape_matching=scopes_without_shape_matching)
 
-    should_init = resuming_state_dict is None
-    composite_builder = PTCompositeCompressionAlgorithmBuilder(config, should_init=should_init)
-    return compressed_model, composite_builder
+    algo_names = extract_algorithm_names(config)
+    assert len(algo_names) == 1
+    algo_name = next(iter(algo_names))
+    builder_cls = PT_COMPRESSION_ALGORITHMS.get(algo_name)
+    builder = builder_cls(config, should_init=True)
+    return compressed_model, builder
 
 
 def create_initialized_compressed_model(model: nn.Module, config: NNCFConfig, train_loader: DataLoader) -> nn.Module:
@@ -445,3 +417,27 @@ def set_torch_seed(seed: int = 42):
     torch.manual_seed(seed)
     yield
     torch.manual_seed(saved_seed)
+
+
+def create_dataloader_with_num_workers(create_dataloader, num_workers, sample_type):
+    def create_dataloader_classification(*args, **kwargs):
+        train_loader, train_sampler, val_loader, init_loader = create_dataloader(*args, **kwargs)
+        init_loader.num_workers = num_workers
+        return train_loader, train_sampler, val_loader, init_loader
+
+    def create_dataloader_semantic_segmentation(*args, **kwargs):
+        (train_loader, val_loader, init_loader), class_weights = create_dataloader(*args, **kwargs)
+        init_loader.num_workers = num_workers
+        return (train_loader, val_loader, init_loader), class_weights
+
+    def create_dataloader_object_detection(*args, **kwargs):
+        test_data_loader, train_data_loader, init_data_loader = create_dataloader(*args, **kwargs)
+        init_data_loader.num_workers = num_workers
+        return test_data_loader, train_data_loader, init_data_loader
+
+    if sample_type == 'classification':
+        return create_dataloader_classification
+    if sample_type == 'semantic_segmentation':
+        return create_dataloader_semantic_segmentation
+    if sample_type == 'object_detection':
+        return create_dataloader_object_detection

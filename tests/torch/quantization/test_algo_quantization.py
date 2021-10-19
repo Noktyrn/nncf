@@ -10,30 +10,28 @@
  See the License for the specific language governing permissions and
  limitations under the License.
 """
-import logging
-from contextlib import contextmanager
 from copy import deepcopy
-from typing import List
-from typing import Tuple
+from typing import List, Tuple
 
 import pytest
 import torch
-import torch.nn as nn
+from torch import nn
 import torch.nn.functional as F
 import torch.utils.data
 from torchvision.models import resnet50
 from torchvision.models import squeezenet1_1
 
+from nncf.common.utils.debug import nncf_debug
 from nncf.api.compression import CompressionScheduler
 from nncf.torch.checkpoint_loading import load_state
 from nncf.common.quantization.structs import QuantizationMode
 from nncf.common.quantization.structs import QuantizerConfig
-from nncf.torch.composite_compression import PTCompositeCompressionAlgorithmBuilder
 from nncf.torch.compression_method_api import PTCompressionLoss
 from nncf.torch.dynamic_graph.scope import Scope
 from nncf.torch.dynamic_graph.scope import ScopeElement
 from nncf.common.hardware.config import HWConfigType
 from nncf.torch.layers import NNCFConv2d
+from nncf.torch.model_creation import create_compression_algorithm_builder
 from nncf.torch.module_operations import UpdateInputs
 from nncf.torch.module_operations import UpdateWeight
 from nncf.torch.nncf_network import ExtraCompressionModuleType
@@ -170,9 +168,8 @@ def test_can_load_quant_algo__with_defaults():
     model = BasicConvTestModel()
     config = get_quantization_config_without_range_init()
     register_bn_adaptation_init_args(config)
-    composite_builder = PTCompositeCompressionAlgorithmBuilder(config)
-    assert len(composite_builder.child_builders) == 1
-    assert isinstance(composite_builder.child_builders[0], QuantizationBuilder)
+    builder = create_compression_algorithm_builder(config)
+    assert isinstance(builder, QuantizationBuilder)
 
     quant_model, _ = create_compressed_model_and_algo_for_test(deepcopy(model), config)
 
@@ -215,7 +212,7 @@ def activation_quantizers_dumping_worker(current_gpu, config, tmp_path):
     _, qctrl = create_compressed_model_and_algo_for_test(model, config)
     path = get_path_to_keys(tmp_path, current_gpu)
     print(path)
-    with open(path, 'w') as f:
+    with open(path, 'w', encoding='utf8') as f:
         for aq_id in qctrl.non_weight_quantizers:
             f.writelines("%s\n" % str(aq_id))
 
@@ -233,10 +230,10 @@ def test_activation_quantizers_order_is_the_same__for_resnet50(tmp_path, runs_su
                                 args=(config, tmp_path),
                                 join=True)
 
-    with open(get_path_to_keys(tmp_path, 0), 'r') as f:
+    with open(get_path_to_keys(tmp_path, 0), 'r', encoding='utf8') as f:
         ref_list = f.readlines()
     for i in range(1, ngpus_per_node):
-        with open(get_path_to_keys(tmp_path, i), 'r') as f:
+        with open(get_path_to_keys(tmp_path, i), 'r', encoding='utf8') as f:
             curr_list = f.readlines()
             assert curr_list == ref_list
 
@@ -547,18 +544,13 @@ def test_quantize_outputs_with_scope_overrides():
     register_bn_adaptation_init_args(config)
     model, ctrl = create_compressed_model_and_algo_for_test(model, config)
     output_quantizers =\
-        [q for qid, q in ctrl.all_quantizations.items() if isinstance(qid, NonWeightQuantizerId)][:-1]
-    for q in output_quantizers:
-        assert q.num_bits == 4
-        assert isinstance(q, AsymmetricQuantizer)
+        [q for qid, q in ctrl.all_quantizations.items() if isinstance(qid, NonWeightQuantizerId)]
+    for q in output_quantizers[1:]:
+        assert q.num_bits == 8
+        assert isinstance(q, SymmetricQuantizer)
 
-
-@contextmanager
-def nncf_debug():
-    from nncf.torch import set_log_level
-    set_log_level(logging.DEBUG)
-    yield
-    set_log_level(logging.INFO)
+    assert output_quantizers[0].num_bits == 4
+    assert isinstance(output_quantizers[0], AsymmetricQuantizer)
 
 
 def test_debug_mode():
@@ -569,3 +561,103 @@ def test_debug_mode():
         model, _ = create_compressed_model_and_algo_for_test(model, config)
         model.forward(torch.zeros(BasicConvTestModel.INPUT_SIZE,
                                   device=next(model.parameters()).device))
+
+
+class SharedLayersModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.shared_conv = torch.nn.Conv2d(1, 1, 1)
+
+    def forward(self, x):
+        x = self.shared_conv(x)
+        x = x + x
+        x = self.shared_conv(x)
+        x = x * x
+        return x
+
+
+def test_shared_layers_are_weight_quantized_only_once():
+    model = SharedLayersModel()
+    config = get_quantization_config_without_range_init(model_size=1)
+    register_bn_adaptation_init_args(config)
+    model, qctrl = create_compressed_model_and_algo_for_test(model, config)
+    assert len(qctrl.weight_quantizers) == 1
+
+
+TEST_QUANTIZATION_PRESET_STRUCT = [
+    {
+        'preset': 'performance',
+        'target_device': 'CPU',
+        'overrided_param' : {},
+        'expected_weights_q': SymmetricQuantizer,
+        'expected_activations_q': SymmetricQuantizer
+    },
+    {
+        'preset': 'mixed',
+        'target_device': 'CPU',
+        'overrided_param' : {},
+        'expected_weights_q': SymmetricQuantizer,
+        'expected_activations_q': AsymmetricQuantizer
+    },
+    {
+        'preset': 'performance',
+        'target_device': 'GPU',
+        'overrided_param' : {},
+        'expected_weights_q': SymmetricQuantizer,
+        'expected_activations_q': SymmetricQuantizer
+    },
+    {
+        'preset': 'mixed',
+        'target_device': 'GPU',
+        'overrided_param' : {},
+        'expected_weights_q': SymmetricQuantizer,
+        'expected_activations_q': AsymmetricQuantizer
+    },
+    {
+        'preset': 'performance',
+        'target_device': 'CPU',
+        'overrided_param' : {'weights': {'mode': 'asymmetric'}},
+        'expected_weights_q': AsymmetricQuantizer,
+        'expected_activations_q': SymmetricQuantizer
+    }]
+
+@pytest.mark.parametrize('data', TEST_QUANTIZATION_PRESET_STRUCT)
+def test_quantization_preset(data):
+    model = BasicConvTestModel()
+    config = get_empty_config(input_sample_sizes=[1, 1, 4, 4])
+    config['target_device']  = data['target_device']
+    config['compression'] = {'algorithm': 'quantization', 'preset': data['preset']}
+    config['compression'].update(data['overrided_param'])
+    register_bn_adaptation_init_args(config)
+    _, compression_ctrl = create_compressed_model_and_algo_for_test(model, config)
+
+    for wq_info in compression_ctrl.weight_quantizers.values():
+        assert isinstance(wq_info.quantizer_module_ref, data['expected_weights_q'])
+
+    for aq_info in compression_ctrl.non_weight_quantizers.values():
+        assert isinstance(aq_info.quantizer_module_ref, data['expected_activations_q'])
+
+def test_quantization_preset_with_scope_overrides():
+    model = QuantizeOutputsTestModel()
+    config = get_empty_config(input_sample_sizes=[2, 3, 32, 32])
+    config['target_device'] = "TRIAL"
+    config['compression'] = {'algorithm': 'quantization',
+                             'preset': 'mixed',
+                             'scope_overrides': {
+                                 'weights': {
+                                    'QuantizeOutputsTestModel/NNCFConv2d[conv5]/conv2d_0': {
+                                        "mode": "asymmetric",
+                                    }}
+                             }}
+    register_bn_adaptation_init_args(config)
+    _, compression_ctrl = create_compressed_model_and_algo_for_test(model, config)
+
+    for wq_info in compression_ctrl.weight_quantizers.values():
+        if wq_info.affected_insertions[0].target_node_name !=\
+             'QuantizeOutputsTestModel/NNCFConv2d[conv5]/conv2d_0':
+            assert isinstance(wq_info.quantizer_module_ref, SymmetricQuantizer)
+        else:
+            assert isinstance(wq_info.quantizer_module_ref, AsymmetricQuantizer)
+
+    for aq_info in compression_ctrl.non_weight_quantizers.values():
+        assert isinstance(aq_info.quantizer_module_ref, AsymmetricQuantizer)

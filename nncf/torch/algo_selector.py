@@ -12,6 +12,8 @@
 """
 
 # pylint:disable=relative-beyond-top-level
+from typing import Dict
+
 import torch
 
 from nncf.torch.graph.transformations.layout import PTTransformationLayout
@@ -23,12 +25,13 @@ from nncf.torch.compression_method_api import PTCompressionAlgorithmBuilder
 from nncf.torch.compression_method_api import PTCompressionAlgorithmController
 
 from nncf.torch.compression_method_api import PTCompressionLoss
+from nncf.common.compression import NO_COMPRESSION_ALGORITHM_NAME
 from nncf.common.schedulers import StubCompressionScheduler
 from nncf.common.utils.registry import Registry
 from nncf.common.statistics import NNCFStatistics
 
 
-COMPRESSION_ALGORITHMS = Registry('compression algorithm', add_name_as_attr=True)
+PT_COMPRESSION_ALGORITHMS = Registry('compression algorithm', add_name_as_attr=True)
 
 
 class ZeroCompressionLoss(PTCompressionLoss):
@@ -40,15 +43,21 @@ class ZeroCompressionLoss(PTCompressionLoss):
         return torch.zeros([], device=self._device)
 
 
-@COMPRESSION_ALGORITHMS.register('NoCompressionAlgorithmBuilder')
+@PT_COMPRESSION_ALGORITHMS.register(NO_COMPRESSION_ALGORITHM_NAME)
 class NoCompressionAlgorithmBuilder(PTCompressionAlgorithmBuilder):
     def _get_transformation_layout(self, target_model: NNCFNetwork) -> PTTransformationLayout:
         return PTTransformationLayout()
 
-    def build_controller(self, target_model: NNCFNetwork) -> PTCompressionAlgorithmController:
-        return NoCompressionAlgorithmController(target_model)
+    def _get_algo_specific_config_section(self) -> Dict:
+        return {}
+
+    def _build_controller(self, model: NNCFNetwork) -> PTCompressionAlgorithmController:
+        return NoCompressionAlgorithmController(model)
 
     def initialize(self, model: NNCFNetwork) -> None:
+        pass
+
+    def _handle_frozen_layers(self, target_model: NNCFNetwork):
         pass
 
 

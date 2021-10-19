@@ -153,9 +153,9 @@ class TestSotaCheckpoints:
             env['VIRTUAL_ENV'] = str(venv)
             env['PATH'] = str(f'{venv}/bin') + ':' + env['PATH']
 
-        result = subprocess.Popen(com_line, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                  cwd=cwd, env=env)
-        exit_code = result.poll()
+        with subprocess.Popen(com_line, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  cwd=cwd, env=env) as result:
+            exit_code = result.poll()
 
         def process_line(decoded_line: str, error_lines: List):
             if re.search(r'Error|ERROR|(No module named)', decoded_line):
@@ -206,7 +206,7 @@ class TestSotaCheckpoints:
     @staticmethod
     def write_error_in_csv(error_message, filename, model_name):
         error_message = 'Error ' + error_message[:80].replace("\n", '')
-        with open(filename, 'w', newline='') as csvfile:
+        with open(filename, 'w', newline='', encoding='utf8') as csvfile:
             fieldnames = ['model', 'launcher', 'device', 'dataset', 'tags', 'metric_name', 'metric_type',
                           'metric_value']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -250,13 +250,12 @@ class TestSotaCheckpoints:
                         with tag('td'):
                             text(i)
         print('Write results at ', path / 'results.html')
-        f = open(path / 'results.html', 'w')
-        f.write(doc.getvalue())
-        f.close()
+        with open(path / 'results.html', 'w', encoding='utf8') as f:
+            f.write(doc.getvalue())
 
     @staticmethod
     def get_input_shape(config):
-        with open(PROJECT_ROOT / config) as file:
+        with open(PROJECT_ROOT / config, encoding='utf8') as file:
             config_file = json.load(file)
             shape = str(config_file['input_info'].get('sample_size'))
             shape = shape.replace(' ', '')
@@ -265,10 +264,10 @@ class TestSotaCheckpoints:
     @staticmethod
     def make_config(config_file, resume_model):
         base_config = config_file.parent / f'{resume_model}.yml'
-        with open(base_config) as f:
+        with open(base_config, encoding='utf8') as f:
             template = yaml.safe_load(f)
         template['models'][0]['name'] = config_file.name.replace('.yml', '')
-        with open(config_file, 'w') as f:
+        with open(config_file, 'w', encoding='utf8') as f:
             yaml.dump(template, f, default_flow_style=False)
 
     @staticmethod
@@ -302,7 +301,7 @@ class TestSotaCheckpoints:
         for file in os.listdir(per_model_metric_file_dump_path):
             filename = os.fsdecode(file)
             if filename.endswith('.metrics.json'):
-                with open(per_model_metric_file_dump_path / filename) as metric_file:
+                with open(per_model_metric_file_dump_path / filename, encoding='utf8') as metric_file:
                     metrics = json.load(metric_file)
                 model_name = str(file).replace('.metrics.json', '')
                 metric_value[model_name] = metrics['Accuracy']
@@ -312,17 +311,17 @@ class TestSotaCheckpoints:
                     data.update(metric_value)
                     common_metrics_file_path.write_text(json.dumps(data, indent=4), encoding='utf-8')
                 else:
-                    with open(str(common_metrics_file_path), 'w') as outfile:
+                    with open(str(common_metrics_file_path), 'w', encoding='utf8') as outfile:
                         json.dump(metric_value, outfile)
 
     @staticmethod
     def read_metric(metric_file_name: str):
-        with open(metric_file_name) as metric_file:
+        with open(metric_file_name, encoding='utf8') as metric_file:
             metrics = json.load(metric_file)
         return metrics['Accuracy']
 
-    sota_eval_config = json.load(open('{}/tensorflow/sota_checkpoints_eval.json'.format(TEST_ROOT)),
-                                 object_pairs_hook=OrderedDict)
+    with open('{}/tensorflow/sota_checkpoints_eval.json'.format(TEST_ROOT), encoding='utf8') as f:
+        sota_eval_config = json.load(f, object_pairs_hook=OrderedDict)
     for sample_type_ in sota_eval_config:
         datasets = sota_eval_config[sample_type_]
         for dataset_name in datasets:
@@ -462,7 +461,7 @@ class TestSotaCheckpoints:
                 pytest.metrics_dump_path / self.get_metric_file_name(eval_test_struct.reference_ +
                                                                      dataset_type_postfix)
             if os.path.exists(reference_metric_file_path):
-                with open(str(reference_metric_file_path)) as ref_metric:
+                with open(str(reference_metric_file_path), encoding='utf8') as ref_metric:
                     metrics = json.load(ref_metric)
                 if metrics['Accuracy'] != 0:
                     fp32_metric = metrics['Accuracy']
@@ -504,6 +503,8 @@ class TestSotaCheckpoints:
         # pylint: disable=too-many-branches
         if not openvino:
             pytest.skip()
+        # WA to avoid OS error
+        os.environ['HDF5_USE_FILE_LOCKING']='FALSE'
         tf_checkpoint = PROJECT_ROOT / 'frozen_graph' / f'{eval_test_struct.model_name_}.pb'
         ir_model_folder = PROJECT_ROOT / 'ir_models' / eval_test_struct.model_name_
         config = PROJECT_ROOT / 'tests' / 'tensorflow' / 'data' / 'ac_configs' / f'{eval_test_struct.model_name_}.yml'
@@ -520,6 +521,9 @@ class TestSotaCheckpoints:
         if eval_test_struct.sample_type_ == 'segmentation':
             file = 'evaluation.py'
         csv_result = f'{PROJECT_ROOT}/{eval_test_struct.model_name_}.csv'
+        if eval_test_struct.model_name_.startswith('mask_'):
+            self.write_error_in_csv('AC does not support mask models yet', csv_result, eval_test_struct.model_name_)
+            pytest.skip('AC does not support mask models yet')
         if eval_test_struct.reference_ and not config.is_file():
             self.make_config(config, eval_test_struct.reference_)
         save_cmd = f'{sys.executable} examples/tensorflow/{eval_test_struct.sample_type_}/{file}' \
@@ -564,7 +568,7 @@ Tsc = TestSotaCheckpoints
 @pytest.fixture(autouse=True, scope='class')
 def openvino_preinstall(openvino):
     if openvino:
-        subprocess.run(f'virtualenv -ppython3.7 {MO_VENV_DIR}', cwd=PROJECT_ROOT, check=True, shell=True)
+        subprocess.run(f'virtualenv -ppython3.8 {MO_VENV_DIR}', cwd=PROJECT_ROOT, check=True, shell=True)
         subprocess.run(f'{venv_activate_string} && {MO_VENV_DIR}/bin/pip install -r requirements_tf2.txt',
                        cwd=MO_DIR, check=True, shell=True, executable='/bin/bash')
         subprocess.run('pip install scikit-image!=0.18.2rc1', cwd=ACC_CHECK_DIR, check=True, shell=True)

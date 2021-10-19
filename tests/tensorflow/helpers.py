@@ -10,15 +10,22 @@
  See the License for the specific language governing permissions and
  limitations under the License.
 """
+from typing import Union
 
+import numbers
 import numpy as np
 import tensorflow as tf
+from nncf.common.compression import BaseCompressionAlgorithmController
 from tensorflow.python.ops.init_ops import Constant
 
 from nncf import NNCFConfig
 from nncf.tensorflow.helpers.model_creation import create_compressed_model
+from tests.common.helpers import BaseTensorListComparator
 
 from examples.tensorflow.common.object_detection.datasets.builder import COCODatasetBuilder
+from examples.tensorflow.classification.datasets.builder import DatasetBuilder
+
+TensorType = Union[tf.Tensor, tf.Variable, np.ndarray, numbers.Number]
 
 
 def get_conv_init_value(shape, value):
@@ -29,7 +36,7 @@ def get_conv_init_value(shape, value):
     return value
 
 
-def get_empty_config(input_sample_sizes=None):
+def get_empty_config(input_sample_sizes=None) -> NNCFConfig:
     if input_sample_sizes is None:
         input_sample_sizes = [1, 4, 4, 1]
 
@@ -84,10 +91,12 @@ def get_basic_n_conv_test_model(input_shape=(24, 24, 1), in_out_ch=((1, 3), (3, 
     return tf.keras.Model(inputs=inputs, outputs=outputs)
 
 
-def create_compressed_model_and_algo_for_test(model, config, should_init=True):
+def create_compressed_model_and_algo_for_test(model, config, compression_state=None, force_no_init=False):
     assert isinstance(config, NNCFConfig)
     tf.keras.backend.clear_session()
-    algo, model = create_compressed_model(model, config, should_init)
+    if force_no_init:
+        compression_state = {BaseCompressionAlgorithmController.BUILDER_STATE: {}}
+    algo, model = create_compressed_model(model, config, compression_state)
     return model, algo
 
 
@@ -104,11 +113,14 @@ def create_conv(in_channels, out_channels, kernel_size, weight_init, bias_init, 
     return conv_cls(**args)
 
 
-def check_equal(test, reference, rtol=1e-4):
-    test = test.numpy()
-    reference = reference.numpy()
-    for i, (x, y) in enumerate(zip(test, reference)):
-        np.testing.assert_allclose(x, y, rtol=rtol, err_msg="Index: {}".format(i))
+class TFTensorListComparator(BaseTensorListComparator):
+    @classmethod
+    def _to_numpy(cls, tensor: TensorType) -> Union[np.ndarray, numbers.Number]:
+        if isinstance(tensor, (tf.Tensor, tf.Variable)):
+            return tensor.numpy()
+        if isinstance(tensor, (np.ndarray, numbers.Number)):
+            return tensor
+        raise Exception(f'Tensor must be numbers.Number, np.ndarray, tf.Tensor or tf.Variable, not {type(tensor)}')
 
 
 class MockCOCODatasetBuilder(COCODatasetBuilder):
@@ -125,22 +137,48 @@ def get_coco_dataset_builders(config, num_devices, **kwargs):
                                                is_train=True,
                                                num_devices=num_devices))
 
-        if kwargs.get('calibration', False):
-            config_ = config.deepcopy()
-            config_.batch_size = builders[0].batch_size
-            builders.append(MockCOCODatasetBuilder(config=config_,
-                                                   is_train=True,
-                                                   num_devices=1))
-
     if kwargs.get('validation', False):
         builders.append(MockCOCODatasetBuilder(config=config,
                                                is_train=False,
                                                num_devices=num_devices))
 
+    if kwargs.get('calibration', False):
+        config_ = config.deepcopy()
+        config_.batch_size = builders[0].batch_size
+        builders.append(MockCOCODatasetBuilder(config=config_,
+                                               is_train=True,
+                                               num_devices=1))
+
     if len(builders) == 1:
         builders = builders[0]
 
     return builders
+
+
+class MockCIFAR10DatasetBuilder(DatasetBuilder):
+    @property
+    def num_examples(self):
+        return 10
+
+
+def get_cifar10_dataset_builders(config, num_devices, one_hot=True):
+    image_size = config.input_info.sample_size[-2]
+
+    train_builder = MockCIFAR10DatasetBuilder(
+        config,
+        image_size=image_size,
+        num_devices=num_devices,
+        one_hot=one_hot,
+        is_train=True)
+
+    val_builder = MockCIFAR10DatasetBuilder(
+        config,
+        image_size=image_size,
+        num_devices=num_devices,
+        one_hot=one_hot,
+        is_train=False)
+
+    return [train_builder, val_builder]
 
 
 def get_weight_by_name(layer, name):

@@ -6,7 +6,6 @@ import re
 import shlex
 import subprocess
 import sys
-import sysconfig
 from collections import OrderedDict
 from pathlib import Path
 from typing import List
@@ -30,7 +29,6 @@ DIFF_TARGET_MAX_GLOBAL = 0.1
 DIFF_FP32_MIN_GLOBAL = -1.0
 DIFF_FP32_MAX_GLOBAL = 0.1
 
-ONNX_PATH = '/home/jenkins/workspace/NNCF/manual/Convert_ONNX/src/onnx/'
 OPENVINO_DIR = PROJECT_ROOT.parent / 'intel' / 'openvino'
 if not os.path.exists(OPENVINO_DIR):
     OPENVINO_DIR = PROJECT_ROOT.parent / 'intel' / 'openvino_2021'
@@ -87,9 +85,10 @@ class TestSotaCheckpoints:
     def get_metric_file_name(model_name: str):
         return "{}.metrics.json".format(model_name)
 
-    CMD_FORMAT_STRING = "{} examples/torch/{sample_type}/main.py -m {} --config {conf} \
+    CMD_FORMAT_STRING = "{} tests/torch/run_examples_for_test_sota.py {sample_type} -m {} --config {conf} \
          --data {dataset}/{data_name}/ --log-dir={log_dir} --metrics-dump \
           {metrics_dump_file_path}"
+
 
     @staticmethod
     def q_dq_config(config):
@@ -124,9 +123,10 @@ class TestSotaCheckpoints:
             env["PYTHONPATH"] += ":" + str(PROJECT_ROOT)
         else:
             env["PYTHONPATH"] = str(PROJECT_ROOT)
-        result = subprocess.Popen(com_line, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                  cwd=cwd, env=env)
-        exit_code = result.poll()
+
+        with subprocess.Popen(com_line, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  cwd=cwd, env=env) as result:
+            exit_code = result.poll()
 
         def process_line(decoded_line: str, error_lines: List):
             if re.search('Error|(No module named)', decoded_line):
@@ -188,7 +188,7 @@ class TestSotaCheckpoints:
 
     @staticmethod
     def write_error_in_csv(error_message, filename):
-        with open(f'{filename}.csv', 'w', newline='') as csvfile:
+        with open(f'{filename}.csv', 'w', newline='', encoding='utf8') as csvfile:
             fieldnames = ['model', 'launcher', 'device', 'dataset', 'tags', 'metric_name', 'metric_type',
                           'metric_value']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -231,9 +231,9 @@ class TestSotaCheckpoints:
                             i = '-'
                         with tag('td'):
                             text(i)
-        f = open(path / 'results.html', 'w')
-        f.write(doc.getvalue())
-        f.close()
+        with open(path / 'results.html', 'w', encoding='utf8') as f:
+            f.write(doc.getvalue())
+
 
     @staticmethod
     def threshold_check(is_ok, diff_target, diff_fp32_min_=None, diff_fp32_max_=None, fp32_metric=None,
@@ -267,9 +267,9 @@ class TestSotaCheckpoints:
         for root, dirs, files in os.walk(per_model_metric_file_dump_path):
             for file in files:
                 metric_file_path = per_model_metric_file_dump_path / file
-                with open(str(metric_file_path)) as metric_file:
+                with open(str(metric_file_path), encoding='utf8') as metric_file:
                     metrics = json.load(metric_file)
-                model_name = str(file).split('.')[0]
+                model_name = str(file).split('.', maxsplit=1)[0]
                 metric_value[model_name] = metrics['Accuracy']
                 common_metrics_file_path = per_model_metric_file_dump_path / 'metrics.json'
                 if common_metrics_file_path.is_file():
@@ -277,18 +277,18 @@ class TestSotaCheckpoints:
                     data.update(metric_value)
                     common_metrics_file_path.write_text(json.dumps(data, indent=4), encoding='utf-8')
                 else:
-                    with open(str(common_metrics_file_path), 'w') as outfile:
+                    with open(str(common_metrics_file_path), 'w', encoding='utf8') as outfile:
                         json.dump(metric_value, outfile)
                 dirs.clear()
 
     @staticmethod
     def read_metric(metric_file_name: str):
-        with open(metric_file_name) as metric_file:
+        with open(metric_file_name, encoding='utf8') as metric_file:
             metrics = json.load(metric_file)
         return metrics['Accuracy']
 
-    sota_eval_config = json.load(open('{}/sota_checkpoints_eval.json'.format(os.path.join(TEST_ROOT, 'torch'))),
-                                 object_pairs_hook=OrderedDict)
+    with open('{}/sota_checkpoints_eval.json'.format(os.path.join(TEST_ROOT, 'torch')), encoding='utf8') as f:
+        sota_eval_config = json.load(f, object_pairs_hook=OrderedDict)
     for sample_type_ in sota_eval_config:
         datasets = sota_eval_config[sample_type_]
         for dataset_name in datasets:
@@ -385,7 +385,7 @@ class TestSotaCheckpoints:
             reference_metric_file_path = pytest.metrics_dump_path / \
                                          self.get_metric_file_name(eval_test_struct.reference_)
             if os.path.exists(reference_metric_file_path):
-                with open(str(reference_metric_file_path)) as ref_metric:
+                with open(str(reference_metric_file_path), encoding='utf8') as ref_metric:
                     metrics = json.load(ref_metric)
                 if metrics['Accuracy'] != 0:
                     fp32_metric = metrics['Accuracy']
@@ -433,28 +433,28 @@ class TestSotaCheckpoints:
         onnx_path = PROJECT_ROOT / 'onnx'
         q_dq_config_path = tmpdir / os.path.basename(eval_test_struct.config_name_)
 
-        with open(str(q_dq_config_path), 'w') as outfile:
+        with open(str(q_dq_config_path), 'w', encoding='utf8') as outfile:
             json.dump(self.q_dq_config(eval_test_struct.config_name_), outfile)
         if not os.path.exists(onnx_path):
             os.mkdir(onnx_path)
-        self.CMD_FORMAT_STRING = "{} examples/torch/{sample_type}/main.py --cpu-only --config {conf} \
+        CMD_FORMAT_STRING = "{} examples/torch/{sample_type}/main.py -m export --cpu-only --config {conf} \
              --data {dataset}/{data_name} --to-onnx={onnx_path}"
         self.test = "openvino_eval"
         if onnx_type == "q_dq":
             if not os.path.exists(onnx_path / 'q_dq'):
                 os.mkdir(onnx_path / 'q_dq')
             onnx_name = str("q_dq/" + eval_test_struct.model_name_ + ".onnx")
-            with open(str(q_dq_config_path), 'w') as outfile:
+            with open(str(q_dq_config_path), 'w', encoding='utf8') as outfile:
                 json.dump(self.q_dq_config(eval_test_struct.config_name_), outfile)
             nncf_config_path = q_dq_config_path
         else:
             onnx_name = str(eval_test_struct.model_name_ + ".onnx")
             nncf_config_path = eval_test_struct.config_name_
-        onnx_cmd = self.CMD_FORMAT_STRING.format(sys.executable, conf=nncf_config_path,
-                                                 dataset=sota_data_dir,
-                                                 data_name=eval_test_struct.dataset_name_,
-                                                 sample_type=eval_test_struct.sample_type_,
-                                                 onnx_path=(onnx_path / onnx_name))
+        onnx_cmd = CMD_FORMAT_STRING.format(sys.executable, conf=nncf_config_path,
+                                            dataset=sota_data_dir,
+                                            data_name=eval_test_struct.dataset_name_,
+                                            sample_type=eval_test_struct.sample_type_,
+                                            onnx_path=(onnx_path / onnx_name))
         if eval_test_struct.resume_file_:
             resume_file_path = sota_checkpoints_dir + '/' + eval_test_struct.resume_file_
             onnx_cmd += " --resume {}".format(resume_file_path)
@@ -538,12 +538,7 @@ Tsc = TestSotaCheckpoints
 def openvino_preinstall(ov_data_dir):
     if ov_data_dir:
         subprocess.run("pip install -r requirements_onnx.txt", cwd=MO_DIR, check=True, shell=True)
-        subprocess.run("pip install scikit-image==0.17.2", check=True, shell=True)
-        subprocess.run("{} setup.py install".format(sys.executable), cwd=ACC_CHECK_DIR, check=True, shell=True)
-
-        # Workaround to fix protobuf error
-        subprocess.run("touch __init__.py", cwd=os.path.join(sysconfig.get_paths()["purelib"], 'google'),
-                       check=True, shell=True)
+        subprocess.run(f"{sys.executable} setup.py install", cwd=ACC_CHECK_DIR, check=True, shell=True)
 
 
 @pytest.fixture(autouse=True, scope="class")

@@ -10,10 +10,9 @@
  See the License for the specific language governing permissions and
  limitations under the License.
 """
-import functools
+
 import inspect
 from collections import OrderedDict
-from copy import deepcopy
 from enum import Enum
 from typing import Callable
 from typing import Dict
@@ -22,7 +21,9 @@ from typing import Optional
 from typing import Tuple
 from typing import TypeVar
 
+import functools
 import torch
+from copy import deepcopy
 from torch import nn
 
 from nncf.common.graph.definitions import MODEL_INPUT_OP_NAME
@@ -39,7 +40,7 @@ from nncf.common.utils.logger import logger as nncf_logger
 from nncf.common.utils.ordered_enum import OrderedEnum
 from nncf.torch.debug import CombinedDebugInterface
 from nncf.torch.debug import debuggable_forward
-from nncf.torch.debug import is_debug
+from nncf.common.utils.debug import is_debug
 from nncf.torch.dynamic_graph.context import TracingContext
 from nncf.torch.dynamic_graph.graph import DynamicGraph
 from nncf.torch.dynamic_graph.graph import ShapeIgnoringTensorMetaComparator
@@ -151,6 +152,9 @@ class PTInsertionPoint:
 
 @ignore_scope
 class NNCFNetwork(nn.Module, PostGraphBuildActing):
+    MODEL_STATE_VERSION_ATTR = '_nncf_model_state_version'
+    MODEL_STATE_VERSION = 1
+
     def __init__(self, module, input_infos: List[ModelInputInfo],
                  dummy_forward_fn=None, wrap_inputs_fn=None, scopes_without_shape_matching=None,
                  ignored_scopes=None, target_scopes=None, reset: bool = False, wrap_outputs_fn=None,
@@ -334,10 +338,36 @@ class NNCFNetwork(nn.Module, PostGraphBuildActing):
             raise RuntimeError("Unsupported insertion type: {}".format(point.insertion_type))
 
     def __getattr__(self, name):
-        wrapped_module = super().__getattr__(MODEL_WRAPPED_BY_NNCF_ATTR_NAME)
-        if hasattr(wrapped_module, name):
-            return getattr(wrapped_module, name)
-        return super().__getattr__(name)
+        class NotFound:
+            pass
+
+        def get_nncf_network_attr(self, name):
+            if name in self.__dict__:
+                return self.__dict__[name]
+            return NotFound
+
+        def get_nncf_module_attr(self, name):
+            if hasattr(self.__dict__['_modules'][MODEL_WRAPPED_BY_NNCF_ATTR_NAME], name):
+                attr = getattr(self.__dict__['_modules'][MODEL_WRAPPED_BY_NNCF_ATTR_NAME], name)
+                if hasattr(attr, '__self__'):  # If it is a bound function
+                    from functools import partial
+                    attr = partial(attr.__func__, self)
+                    return attr
+                # If it is not a bound function
+                return attr
+            return NotFound
+
+        def get_nn_module_attr(self, name):
+            return super().__getattr__(name)
+
+        attr = get_nncf_network_attr(self, name)
+        if attr != NotFound:
+            return attr
+        attr = get_nncf_module_attr(self, name)
+        if attr != NotFound:
+            return attr
+        return get_nn_module_attr(self, name)
+
 
     def get_graph(self) -> PTNNCFGraph:
         if self._compressed_context.graph.get_nodes_count() == 0 or self._compressed_graph is None:

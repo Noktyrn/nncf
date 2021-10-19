@@ -16,26 +16,21 @@ from abc import ABC
 from abc import abstractmethod
 from copy import deepcopy
 from functools import partial
-from typing import Callable
-from typing import Dict
-from typing import List
-from typing import Tuple
-from typing import Union
+from typing import Callable, Dict, List, Tuple, Union
 
 import networkx as nx
 import pytest
 import torch
-import torch.nn as nn
+from torch import nn
 import torch.nn.functional as F
 import torchvision
 
-from nncf.common.graph import NNCFNodeName
 from nncf.common.hardware.config import HWConfigType
 from nncf.common.quantization.quantizer_setup import ActivationQuantizationInsertionPoint
 from nncf.common.quantization.quantizer_setup import SingleConfigQuantizerSetup
 from nncf.torch import nncf_model_input
 from nncf.torch import nncf_model_output
-from nncf.torch.composite_compression import PTCompositeCompressionAlgorithmBuilder
+from nncf.common.graph import NNCFNodeName
 from nncf.torch.dynamic_graph.graph_tracer import ModelInputInfo
 from nncf.torch.dynamic_graph.graph_tracer import create_dummy_forward_fn
 from nncf.torch.dynamic_graph.graph_tracer import create_input_infos
@@ -45,6 +40,7 @@ from nncf.torch.graph.graph_builder import GraphBuilder
 from nncf.torch.layers import LSTMCellNNCF
 from nncf.torch.layers import NNCF_RNN
 from nncf.torch.nncf_network import NNCFNetwork
+from nncf.torch.quantization.algo import QuantizationBuilder
 from nncf.torch.utils import get_all_modules_by_type
 from tests.torch import test_models
 from tests.torch.helpers import create_compressed_model_and_algo_for_test
@@ -86,7 +82,7 @@ def get_basic_quantization_config_with_hw_config_type(hw_config_type, input_samp
 
 
 def sort_dot(path):
-    with open(path, 'r') as f:
+    with open(path, 'r', encoding='utf8') as f:
         content = f.readlines()
     start_line = 'strict digraph  {\n'
     end_line = '}\n'
@@ -101,7 +97,7 @@ def sort_dot(path):
         return int(key)
 
     sorted_content = sorted(content, key=partial(graph_key, offset=len(content)))
-    with open(path, 'w') as f:
+    with open(path, 'w', encoding='utf8') as f:
         f.write(start_line)
         f.writelines(sorted_content)
         f.write(end_line)
@@ -383,8 +379,8 @@ def test_gnmt_quantization(_case_config):
                                    ['GNMT/ResidualRecurrentDecoder[decoder]/RecurrentAttention[att_rnn]/'
                                     'BahdanauAttention[attn]'])
 
-    composite_builder = PTCompositeCompressionAlgorithmBuilder(config)
-    composite_builder.apply_to(compressed_model)
+    builder = QuantizationBuilder(config, should_init=False)
+    builder.apply_to(compressed_model)
 
     check_model_graph(compressed_model, 'gnmt_variable.dot', _case_config.graph_dir)
 
@@ -773,7 +769,7 @@ def test_compressed_graph_models_hw(desc, hw_config_type):
     compressed_model = NNCFNetwork(model, input_infos=input_info_list)
 
     # pylint:disable=protected-access
-    quantization_builder = PTCompositeCompressionAlgorithmBuilder(config).child_builders[0]  # type: QuantizationBuilder
+    quantization_builder = QuantizationBuilder(config, should_init=False)
     single_config_quantizer_setup = quantization_builder._get_quantizer_setup(compressed_model)
     sketch_graph = compressed_model.get_original_graph()
 

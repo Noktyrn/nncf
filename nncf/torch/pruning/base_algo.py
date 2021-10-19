@@ -10,13 +10,16 @@
  See the License for the specific language governing permissions and
  limitations under the License.
 """
-
+import torch
 from functools import partial
 from functools import update_wrapper
-from typing import List
+from typing import List, Dict
 
 from torch import nn
+from texttable import Texttable
 
+from nncf import NNCFConfig
+from nncf.config.extractors import extract_algo_specific_config
 from nncf.torch.algo_selector import ZeroCompressionLoss
 from nncf.common.graph.transformations.commands import TargetType
 from nncf.torch.compression_method_api import PTCompressionAlgorithmBuilder
@@ -29,7 +32,6 @@ from nncf.torch.graph.transformations.commands import PTTargetPoint
 from nncf.torch.graph.transformations.commands import PTInsertionCommand
 from nncf.torch.pruning.export_helpers import PT_PRUNING_OPERATOR_METATYPES
 from nncf.torch.pruning.filter_pruning.layers import apply_filter_binary_mask
-from nncf.common.pruning.pruning_node_selector import PruningNodeSelector
 from nncf.common.pruning.clusterization import Clusterization
 from nncf.common.pruning.clusterization import Cluster
 from nncf.torch.pruning.structs import PrunedModuleInfo
@@ -38,7 +40,8 @@ from nncf.torch.pruning.structs import PrunedModuleInfo
 class BasePruningAlgoBuilder(PTCompressionAlgorithmBuilder):
     def __init__(self, config, should_init: bool = True):
         super().__init__(config, should_init)
-        params = config.get('params', {})
+        params = self._algo_config.get('params', {})
+        self._set_default_params_for_ranking_type(params)
         self._params = params
 
         self.prune_first = params.get('prune_first_conv', False)
@@ -47,6 +50,8 @@ class BasePruningAlgoBuilder(PTCompressionAlgorithmBuilder):
         self.prune_downsample_convs = params.get('prune_downsample_convs', False)
 
         self._prunable_types = self.get_op_types_of_pruned_modules()
+
+        from nncf.common.pruning.pruning_node_selector import PruningNodeSelector
         self.pruning_node_selector = PruningNodeSelector(PT_PRUNING_OPERATOR_METATYPES,
                                                          self._prunable_types,
                                                          self.get_types_of_grouping_ops(),
@@ -57,6 +62,29 @@ class BasePruningAlgoBuilder(PTCompressionAlgorithmBuilder):
                                                          self.prune_downsample_convs)
 
         self.pruned_module_groups_info = []
+
+    @staticmethod
+    def _set_default_params_for_ranking_type(params: Dict) -> None:
+        """
+        Setting default parameter values of pruning algorithm depends on the ranking type:
+        for learned_ranking `all_weights` must be True (in case of False was set by the user, an Exception will be
+        raised), `prune_first_conv`, `prune_last_conv`, `prune_downsample_convs` are recommended to be True (this
+        params will be set to True by default (and remain unchanged if the user sets some value).
+        :param params: dict with parameters of the algorithm from config
+        """
+        learned_ranking = 'interlayer_ranking_type' in params and params['interlayer_ranking_type'] == 'learned_ranking'
+        if not learned_ranking:
+            return
+        nncf_logger.info('For learning global ranking `prune_first_conv`, `prune_last_conv`, `prune_downsample_convs`, '
+                         '`all_weights` are setting to True by default. It is not recommended to set this params'
+                         ' to False.')
+        params.setdefault('prune_first_conv', True)
+        params.setdefault('prune_last_conv', True)
+        params.setdefault('prune_downsample_convs', True)
+        if params.get('all_weights') is False:
+            raise Exception('In case of `interlayer_ranking_type`=`learned_ranking`, `all_weights` must be set to True,'
+                            ' plese, change this in config settings.')
+        params.setdefault('all_weights', True)
 
     def _get_transformation_layout(self, target_model: NNCFNetwork) -> PTTransformationLayout:
         layout = PTTransformationLayout()
@@ -129,16 +157,18 @@ class BasePruningAlgoController(PTCompressionAlgorithmController):
     def __init__(self, target_model: NNCFNetwork,
                  prunable_types: List[str],
                  pruned_module_groups_info: Clusterization[PrunedModuleInfo],
-                 config):
+                 config: NNCFConfig):
         super().__init__(target_model)
         self._loss = ZeroCompressionLoss(next(target_model.parameters()).device)
         self._prunable_types = prunable_types
         self.config = config
-        params = self.config.get("params", {})
+        self.pruning_config = extract_algo_specific_config(config, 'filter_pruning')
+        params = self.pruning_config.get('params', {})
         self.pruned_module_groups_info = pruned_module_groups_info
         self.prune_batch_norms = params.get('prune_batch_norms', True)
         self.prune_first = params.get('prune_first_conv', False)
         self.prune_last = params.get('prune_last_conv', False)
+        self.prune_downsample_convs = params.get('prune_downsample_convs', False)
         self.zero_grad = params.get('zero_grad', True)
         self.prune_flops = False
         self.check_pruning_rate(params)
@@ -191,7 +221,7 @@ class BasePruningAlgoController(PTCompressionAlgorithmController):
             h.remove()
         self._hooks = []
 
-    def _get_mask(self, minfo: PrunedModuleInfo):
+    def get_mask(self, minfo: PrunedModuleInfo) -> torch.Tensor:
         """
         Returns pruning mask for minfo.module.
         """
@@ -218,31 +248,29 @@ class BasePruningAlgoController(PTCompressionAlgorithmController):
         return pruning_rate
 
     def pruning_rate_for_mask(self, minfo: PrunedModuleInfo):
-        mask = self._get_mask(minfo)
+        mask = self.get_mask(minfo)
         pruning_rate = 1 - mask.nonzero().size(0) / max(mask.view(-1).size(0), 1)
         return pruning_rate
 
     def mask_shape(self, minfo: PrunedModuleInfo):
-        mask = self._get_mask(minfo)
+        mask = self.get_mask(minfo)
         return mask.shape
 
     def get_stats_for_pruned_modules(self):
         """
-        Return dict with information about pruned modules. Keys in dict is module names, values is dicts with next keys:
-         'w_shape': shape of module weight,
-         'b_shape': shape of module bias,
-         'params_count': total number of params in module
-         'mask_pr': proportion of zero elements in filter pruning mask.
+        Creates a table with layer pruning rate statistics
         """
-        stats = {}
+        table = Texttable()
+        table.set_cols_width([33, 20, 6, 8])
+        header = ["Name", "Weight's shape", "Bias shape", "Layer PR"]
+        data = [header]
         for minfo in self.pruned_module_groups_info.get_all_nodes():
-            layer_info = {}
-            layer_info["w_shape"] = list(minfo.module.weight.size())
-            layer_info["b_shape"] = list(minfo.module.bias.size()) if minfo.module.bias is not None else []
-            layer_info["params_count"] = sum(p.numel() for p in minfo.module.parameters() if p.requires_grad)
-
-            layer_info["mask_pr"] = self.pruning_rate_for_mask(minfo)
-
-            stats[str(minfo.module_scope)] = layer_info
-
-        return stats
+            drow = {h: 0 for h in header}
+            drow["Name"] = str(minfo.module_scope)
+            drow["Weight's shape"] = list(minfo.module.weight.size())
+            drow["Bias shape"] = list(minfo.module.bias.size()) if minfo.module.bias is not None else []
+            drow["Layer PR"] = self.pruning_rate_for_filters(minfo)
+            row = [drow[h] for h in header]
+            data.append(row)
+        table.add_rows(data)
+        return table

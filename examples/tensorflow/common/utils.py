@@ -25,6 +25,7 @@ import tensorflow as tf
 
 from nncf.common.utils.logger import logger as nncf_logger
 from examples.tensorflow.common.logger import logger as default_logger
+from examples.tensorflow.common.sample_config import CustomArgumentParser
 
 GENERAL_LOG_FILE_NAME = "output.log"
 NNCF_LOG_FILE_NAME = "nncf_output.log"
@@ -35,9 +36,7 @@ FROZEN_GRAPH_FORMAT = 'frozen_graph'
 
 
 def get_name(config):
-    dataset = config.get('dataset', 'imagenet')
-    if dataset is None:
-        dataset = 'imagenet'
+    dataset = config.get('dataset', 'imagenet2012')
     retval = config["model"] + "_" + dataset
     compression_config = config.get('compression', [])
     if not isinstance(compression_config, list):
@@ -66,7 +65,7 @@ def get_name(config):
 def write_metrics(acc, filename):
     avg = round(acc * 100, 2)
     metrics = {"Accuracy": avg}
-    with open(filename, 'w') as outfile:
+    with open(filename, 'w', encoding='utf8') as outfile:
         json.dump(metrics, outfile)
 
 
@@ -80,8 +79,8 @@ def configure_paths(config):
     compression_config = config.get('compression', [])
     if not isinstance(compression_config, list):
         compression_config = [compression_config, ]
-    for algo_config in compression_config:
-        algo_config.log_dir = config.log_dir
+    if config.nncf_config is not None:
+        config.nncf_config["log_dir"] = config.log_dir
 
     if config.checkpoint_save_dir is None:
         config.checkpoint_save_dir = config.log_dir
@@ -111,13 +110,24 @@ def create_code_snapshot(root, dst_path, extensions=(".py", ".json", ".cpp", ".c
 
 
 def print_args(config, logger=default_logger):
-    for arg in sorted(config):
-        logger.info("{: <27s}: {}".format(arg, config.get(arg)))
+    args = 'Command line arguments\n'
+    args += '\n'.join(["{: <27s}: {}".format(arg, config.get(arg)) for arg in sorted(config)])
+    logger.info(args)
 
 
 def serialize_config(config, log_dir):
-    with open(osp.join(log_dir, 'config.json'), 'w') as f:
+    with open(osp.join(log_dir, 'config.json'), 'w', encoding='utf8') as f:
         json.dump(config, f, indent=4)
+
+
+def serialize_cli_args(argparser, argv, log_dir):
+    args = argparser.parse_args(args=argv)
+    if isinstance(argparser, CustomArgumentParser):
+        cli_args = {k:v for k, v in vars(args).items() if k in argparser.seen_actions}
+    else:
+        cli_args = {k:v for k, v in vars(args).items() if v is not None}
+    with open(osp.join(log_dir, 'cli_args.json'), 'w', encoding='utf8') as f:
+        json.dump(cli_args, f, indent=4)
 
 
 def get_saving_parameters(config):

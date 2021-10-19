@@ -28,7 +28,7 @@ import functools
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
+from torch import nn
 import torch.nn.parallel
 import torch.optim
 import torch.utils.data
@@ -41,8 +41,8 @@ from nncf.common.quantization.structs import QuantizerConfig
 from nncf.config.extractors import extract_bn_adaptation_init_params
 from nncf.common.utils.logger import logger
 from nncf.common.hardware.config import HWConfigType
-from nncf.torch.debug import DEBUG_LOG_DIR
-from nncf.torch.debug import is_debug
+from nncf.common.utils.debug import DEBUG_LOG_DIR
+from nncf.common.utils.debug import is_debug
 from nncf.torch.initialization import PartialDataLoader
 from nncf.torch.quantization.layers import BaseQuantizer
 from nncf.torch.quantization.algo import ExperimentalQuantizationController
@@ -421,7 +421,7 @@ class QuantizationEnv:
         bwassigner_df = deepcopy(self.master_df)
         bwassigner_df['bw_space'] = list(map(lambda x: [qc.num_bits for qc in x], bwassigner_df.qconf_space.values))
 
-        adjq_groupwise_intersecting_bw_space = dict()
+        adjq_groupwise_intersecting_bw_space = {}
         for i, _ in enumerate(self.groups_of_adjacent_quantizers):
             list_of_bw_space = []
 
@@ -439,7 +439,7 @@ class QuantizationEnv:
         return adjq_groupwise_intersecting_bw_space
 
     def _create_map_of_adjq_groupid_to_df_lut_keys(self) -> Dict:
-        adjq_groupwise_df_lut_keys = dict()
+        adjq_groupwise_df_lut_keys = {}
 
         for i, _ in enumerate(self.groups_of_adjacent_quantizers):
             group_members = []
@@ -468,11 +468,11 @@ class QuantizationEnv:
     def _run_batchnorm_adaptation(self):
         if self._bn_adaptation is None:
             self._bn_adaptation = BatchnormAdaptationAlgorithm(
-            **extract_bn_adaptation_init_params(self.qctrl.quantization_config))
+            **extract_bn_adaptation_init_params(self.qctrl.config, "quantization"))
         self._bn_adaptation.run(self.qctrl.model)
 
     def _run_quantization_pipeline(self, finetune=False) -> float:
-        if self.qctrl.quantization_config:
+        if self.qctrl.config:
             self._run_batchnorm_adaptation()
 
         if finetune:

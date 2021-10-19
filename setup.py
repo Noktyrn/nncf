@@ -23,7 +23,7 @@ from setuptools import setup, find_packages
 
 here = os.path.abspath(os.path.dirname(__file__))
 
-with open("{}/README.md".format(here), "r") as fh:
+with open("{}/README.md".format(here), "r", encoding="utf8") as fh:
     long_description = fh.read()
 
 if "--tf" in sys.argv:
@@ -105,6 +105,10 @@ if "--torch" in sys.argv:
 if "--tf" in sys.argv:
     INSTALL_REQUIRES.extend(EXTRAS_REQUIRE["tf"])
     sys.argv.remove("--tf")
+
+if "--all" in sys.argv:
+    INSTALL_REQUIRES.extend(EXTRAS_REQUIRE["all"])
+    sys.argv.remove("--all")
 
 setup(
     name="nncf",

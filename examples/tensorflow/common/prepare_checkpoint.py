@@ -16,6 +16,8 @@ import sys
 import tensorflow as tf
 
 from nncf.tensorflow.helpers.model_creation import create_compressed_model
+from nncf.tensorflow.utils.state import TFCompressionState
+from nncf.tensorflow.utils.state import TFCompressionStateLoader
 from examples.tensorflow.common.logger import logger
 from examples.tensorflow.common.sample_config import create_sample_config
 from examples.tensorflow.common.argparser import get_common_argument_parser
@@ -71,6 +73,12 @@ def load_checkpoint(checkpoint, ckpt_path):
     return None
 
 
+def load_compression_state(ckpt_path: str):
+    checkpoint = tf.train.Checkpoint(compression_state=TFCompressionStateLoader())
+    load_checkpoint(checkpoint, ckpt_path)
+    return checkpoint.compression_state.state
+
+
 def od_checkpoint_saver(config):
     """
     Load object detection checkpoint and re-save it without optimizer (memory footprint is reduced).
@@ -78,11 +86,11 @@ def od_checkpoint_saver(config):
     model_builder = get_model_od_builder(config)
     model = model_builder.build_model()
 
-    compression_ctrl, compress_model = create_compressed_model(model,
-                                                               config.nncf_config,
-                                                               should_init=False)
+    compression_state = load_compression_state(config.ckpt_path)
+    compression_ctrl, compress_model = create_compressed_model(model, config.nncf_config, compression_state)
 
-    checkpoint = tf.train.Checkpoint(model=compress_model, compression_ctrl=compression_ctrl)
+    checkpoint = tf.train.Checkpoint(model=compress_model,
+                                     compression_state=TFCompressionState(compression_ctrl))
     load_and_save_checkpoint(checkpoint, config)
 
 
@@ -93,13 +101,12 @@ def seg_checkpoint_saver(config):
     model_builder = get_model_seg_builder(config)
     model = model_builder.build_model()
 
-    compression_ctrl, compress_model = create_compressed_model(model,
-                                                               config.nncf_config,
-                                                               should_init=False)
+    compression_state = load_compression_state(config.ckpt_path)
+    compression_ctrl, compress_model = create_compressed_model(model, config.nncf_config, compression_state)
 
     variables = get_variables(compress_model)
     checkpoint = tf.train.Checkpoint(variables=variables,
-                                     compression_ctrl=compression_ctrl,
+                                     compression_state=TFCompressionState(compression_ctrl),
                                      step=tf.Variable(0))
     load_and_save_checkpoint(checkpoint, config)
 
@@ -109,6 +116,8 @@ def load_and_save_checkpoint(checkpoint, config):
     Load checkpoint and re-save it.
     """
     load_checkpoint(checkpoint, config.ckpt_path)
+    if config.checkpoint_save_dir is None:
+        config.checkpoint_save_dir = config.log_dir
     checkpoint_manager = tf.train.CheckpointManager(checkpoint, config.checkpoint_save_dir, max_to_keep=None)
     save_path = checkpoint_manager.save()
     logger.info('Saved checkpoint: {}'.format(save_path))
@@ -116,7 +125,7 @@ def load_and_save_checkpoint(checkpoint, config):
 
 def main(argv):
     parser = get_common_argument_parser(metrics_dump=False,
-                                        weights=False,
+                                        resume_args=False,
                                         execution_args=False,
                                         epochs=False,
                                         precision=False,
@@ -131,6 +140,15 @@ def main(argv):
         choices=[ModelType.object_detection,
                  ModelType.segmentation],
         help='Type of the model which checkpoint is being provided.',
+        required=True)
+
+    parser.add_argument(
+        '--resume',
+        metavar='PATH',
+        type=str,
+        default=None,
+        dest='ckpt_path',
+        help='Specifies the path to the checkpoint which should be optimized.',
         required=True)
 
     config, model_type = get_config_and_model_type_from_argv(argv, parser)

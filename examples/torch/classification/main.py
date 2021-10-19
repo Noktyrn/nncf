@@ -13,55 +13,80 @@
 import os.path as osp
 import sys
 import time
+import warnings
 from copy import deepcopy
+from functools import partial
 from pathlib import Path
+from shutil import copyfile
 from typing import Any
 from numpy.lib.arraysetops import isin
 
 import torch
-import torch.backends.cudnn as cudnn
-import torch.nn as nn
+from torch.backends import cudnn
+from torch import nn
 import torch.nn.parallel
 import torch.optim
 import torch.utils.data
 import torch.utils.data.distributed
-import torchvision.datasets as datasets
-import torchvision.models as models
 from torchvision.models.googlenet import GoogLeNetOutputs
-import torchvision.transforms as transforms
 import warnings
 from functools import partial, reduce
 from shutil import copyfile
+from torchvision import datasets
+from torchvision import models
+from torchvision import transforms
 from torch.nn.modules.loss import _Loss
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torchvision.datasets import CIFAR10, CIFAR100
+from torchvision.datasets import CIFAR10
+from torchvision.datasets import CIFAR100
 from torchvision.models import InceptionOutputs
 
-from examples.torch.common.execution import set_seed
-from nncf.common.utils.tensorboard import prepare_for_tensorboard
-from nncf.config.utils import is_accuracy_aware_training
+from examples.torch.common.argparser import parse_args
 from examples.torch.common.argparser import get_common_argument_parser
 from examples.torch.common.example_logger import logger
-from examples.torch.common.execution import ExecutionMode, get_execution_mode, \
-    prepare_model_for_execution, start_worker
+from examples.torch.common.execution import ExecutionMode
+from examples.torch.common.execution import get_execution_mode
+from examples.torch.common.execution import prepare_model_for_execution
+from examples.torch.common.execution import set_seed
+from examples.torch.common.execution import start_worker
+from examples.torch.common.model_loader import COMPRESSION_STATE_ATTR
+from examples.torch.common.model_loader import MODEL_STATE_ATTR
+from examples.torch.common.model_loader import extract_model_and_compression_states
 from examples.torch.common.model_loader import load_model
-from examples.torch.common.optimizer import get_parameter_groups, make_optimizer
-from examples.torch.common.sample_config import SampleConfig, create_sample_config
-from examples.torch.common.utils import configure_logging, configure_paths, create_code_snapshot, \
-    print_args, make_additional_checkpoints, get_name, is_staged_quantization, \
-    is_pretrained_model_requested, log_common_mlflow_params, SafeMLFLow, MockDataset, configure_device
+from examples.torch.common.model_loader import load_resuming_checkpoint
+from examples.torch.common.optimizer import get_parameter_groups
+from examples.torch.common.optimizer import make_optimizer
+from examples.torch.common.sample_config import SampleConfig
+from examples.torch.common.sample_config import create_sample_config
+from examples.torch.common.utils import MockDataset
+from examples.torch.common.utils import SafeMLFLow
+from examples.torch.common.utils import configure_device
+from examples.torch.common.utils import configure_logging
+from examples.torch.common.utils import configure_paths
+from examples.torch.common.utils import create_code_snapshot
+from examples.torch.common.utils import get_name
+from examples.torch.common.utils import is_pretrained_model_requested
+from examples.torch.common.utils import is_staged_quantization
+from examples.torch.common.utils import log_common_mlflow_params
+from examples.torch.common.utils import make_additional_checkpoints
+from examples.torch.common.utils import print_args
 from examples.torch.common.utils import write_metrics
-from nncf.torch import create_compressed_model
 from nncf.api.compression import CompressionStage
-from nncf.torch import AdaptiveCompressionTrainingLoop
+from nncf.common.utils.tensorboard import prepare_for_tensorboard
+from nncf.config.utils import is_accuracy_aware_training
+from nncf.common.accuracy_aware_training import create_accuracy_aware_training_loop
+from nncf.torch import create_compressed_model
+from nncf.torch.checkpoint_loading import load_state
 from nncf.torch.dynamic_graph.graph_tracer import create_input_infos
-from nncf.torch.initialization import register_default_init_args, default_criterion_fn
-from nncf.torch.utils import safe_thread_call, is_main_process
-from examples.torch.classification.common import load_resuming_checkpoint
+from nncf.torch.initialization import default_criterion_fn
+from nncf.torch.initialization import register_default_init_args
+from nncf.torch.structures import ExecutionParameters
+from nncf.torch.utils import is_main_process
+from nncf.torch.utils import safe_thread_call
 
-model_names = sorted(name for name in models.__dict__
+model_names = sorted(name for name, val in models.__dict__.items()
                      if name.islower() and not name.startswith("__")
-                     and callable(models.__dict__[name]))
+                     and callable(val))
 
 
 def get_argument_parser():
@@ -79,7 +104,7 @@ def get_argument_parser():
 
 def main(argv):
     parser = get_argument_parser()
-    args = parser.parse_args(args=argv)
+    args = parse_args(parser, argv)
     config = create_sample_config(args, parser)
 
     if config.dist_url == "env://":
@@ -133,6 +158,8 @@ def main_worker(current_gpu, config: SampleConfig):
     if is_main_process():
         configure_logging(logger, config)
         print_args(config)
+    else:
+        config.tb = None
 
     set_seed(config)
 
@@ -155,17 +182,33 @@ def main_worker(current_gpu, config: SampleConfig):
         train_dataset, val_dataset = create_datasets(config)
         train_loader, train_sampler, val_loader, init_loader = create_data_loaders(config, train_dataset, val_dataset)
 
-        def autoq_eval_fn(model, eval_loader):
-            _, top5 = validate(eval_loader, model, criterion, config)
-            return top5
+        def train_steps_fn(loader, model, optimizer, compression_ctrl, train_steps):
+            train_epoch(loader, model, criterion, train_criterion_fn, optimizer, compression_ctrl, 0, config,
+                        train_iters=train_steps, log_training_info=False)
+
+        def validate_model_fn(model, eval_loader):
+            top1, top5, loss = validate(eval_loader, model, criterion, config, log_validation_info=False)
+            return top1, top5, loss
 
         def model_eval_fn(model):
-            top1, _ = validate(val_loader, model, criterion, config)
+            top1, _, _ = validate(val_loader, model, criterion, config)
             return top1
 
+        execution_params = ExecutionParameters(config.cpu_only, config.current_gpu)
+
         nncf_config = register_default_init_args(
-            nncf_config, init_loader, criterion, train_criterion_fn,
-            autoq_eval_fn, val_loader, model_eval_fn, config.device)
+            nncf_config,
+            init_loader,
+            criterion=criterion,
+            criterion_fn=train_criterion_fn,
+            train_steps_fn=train_steps_fn,
+            validate_fn=lambda *x: validate_model_fn(*x)[::2],
+            autoq_eval_fn=lambda *x: validate_model_fn(*x)[1],
+            val_loader=val_loader,
+            model_eval_fn=model_eval_fn,
+            device=config.device,
+            execution_parameters=execution_params,
+        )
 
     # create model
     model = load_model(model_name,
@@ -213,10 +256,9 @@ def main_worker(current_gpu, config: SampleConfig):
     best_acc1 = 0
     # optionally resume from a checkpoint
     if resuming_checkpoint_path is not None:
-        if config.mode.lower() == 'train' and config.to_onnx is None:
+        if 'train' in config.mode:
             config.start_epoch = resuming_checkpoint['epoch']
             best_acc1 = resuming_checkpoint['best_acc1']
-            compression_ctrl.load_state(resuming_checkpoint)
             optimizer.load_state_dict(resuming_checkpoint['optimizer'])
             logger.info("=> loaded checkpoint '{}' (epoch: {}, best_acc1: {:.3f})"
                         .format(resuming_checkpoint_path, resuming_checkpoint['epoch'], best_acc1))
@@ -232,21 +274,18 @@ def main_worker(current_gpu, config: SampleConfig):
         statistics = compression_ctrl.statistics()
         logger.info(statistics.to_str())
 
-    if config.mode.lower() == 'test':
-        validate(val_loader, model, criterion, config)
-
-    if config.mode.lower() == 'train':
+    if 'train' in config.mode:
         if is_accuracy_aware_training(config):
             # validation function that returns the target metric value
             # pylint: disable=E1123
             def validate_fn(model, epoch):
-                top1, _ = validate(val_loader, model, criterion, config, epoch=epoch)
+                top1, _, _ = validate(val_loader, model, criterion, config, epoch=epoch)
                 return top1
 
             # training function that trains the model for one epoch (full training dataset pass)
             # it is assumed that all the NNCF-related methods are properly called inside of
             # this function (like e.g. the step and epoch_step methods of the compression scheduler)
-            def train_epoch_fn(compression_ctrl, model, epoch, optimizer, lr_scheduler):
+            def train_epoch_fn(compression_ctrl, model, epoch, optimizer, **kwargs):
                 return train_epoch(train_loader, model, criterion, train_criterion_fn,
                                    optimizer, compression_ctrl, epoch, config)
 
@@ -256,8 +295,7 @@ def main_worker(current_gpu, config: SampleConfig):
                 optimizer, lr_scheduler = make_optimizer(params_to_optimize, config)
                 return optimizer, lr_scheduler
 
-            # instantiate and run accuracy-aware training loop
-            acc_aware_training_loop = AdaptiveCompressionTrainingLoop(nncf_config, compression_ctrl)
+            acc_aware_training_loop = create_accuracy_aware_training_loop(nncf_config, compression_ctrl)
             model = acc_aware_training_loop.run(model,
                                                 train_epoch_fn=train_epoch_fn,
                                                 validate_fn=validate_fn,
@@ -267,6 +305,9 @@ def main_worker(current_gpu, config: SampleConfig):
         else:
             train(config, compression_ctrl, model, criterion, train_criterion_fn, lr_scheduler, model_name, optimizer,
                   train_loader, train_sampler, val_loader, best_acc1)
+
+    if 'test' in config.mode:
+        validate(val_loader, model, criterion, config)
 
     config.mlflow.end_run()
 
@@ -435,7 +476,7 @@ def train(config, compression_ctrl, model, criterion, criterion_fn, lr_scheduler
         acc1 = best_acc1
         if epoch % config.test_every_n_epochs == 0:
             # evaluate on validation set
-            acc1, _ = validate(val_loader, model, criterion, config, epoch=epoch)
+            acc1, _, _ = validate(val_loader, model, criterion, config, epoch=epoch)
 
         compression_stage = compression_ctrl.compression_stage()
 
@@ -458,12 +499,11 @@ def train(config, compression_ctrl, model, criterion, criterion_fn, lr_scheduler
             checkpoint = {
                 'epoch': epoch + 1,
                 'arch': model_name,
-                'state_dict': model.state_dict(),
+                MODEL_STATE_ATTR: model.state_dict(),
+                COMPRESSION_STATE_ATTR: compression_ctrl.get_compression_state(),
                 'best_acc1': best_acc1,
-                'compression_stage': compression_stage,
                 'acc1': acc1,
                 'optimizer': optimizer.state_dict(),
-                'scheduler': compression_ctrl.scheduler.get_state()
             }
 
             torch.save(checkpoint, checkpoint_path)
@@ -515,7 +555,7 @@ def create_datasets(config):
 
     input_info_list = create_input_infos(config)
     image_size = input_info_list[0].shape[-1]
-
+    size = int(image_size / 0.875)
     if dataset_config in ['cifar10', 'cifar100']:
         val_transform = transforms.Compose([
             transforms.ToTensor(),
@@ -527,8 +567,20 @@ def create_datasets(config):
             transforms.ToTensor(),
             normalize,
         ])
+    elif dataset_config in ['mock_32x32', 'mock_299x299']:
+        val_transform = transforms.Compose([
+            transforms.Resize(size),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            normalize,
+        ])
+        train_transforms = transforms.Compose([
+            transforms.Resize(size),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            normalize,
+        ])
     else:
-        size = int(image_size / 0.875)
         val_transform = transforms.Compose([
             transforms.Resize(size),
             transforms.CenterCrop(image_size),
@@ -565,7 +617,7 @@ def create_data_loaders(config, train_dataset, val_dataset):
         val_dataset,
         batch_size=batch_size, shuffle=False,
         num_workers=workers, pin_memory=pin_memory,
-        sampler=val_sampler, drop_last=True)
+        sampler=val_sampler, drop_last=False)
 
     train_sampler = None
     if config.distributed:
@@ -576,6 +628,7 @@ def create_data_loaders(config, train_dataset, val_dataset):
                                                                         shuffle=dist_sampler_shuffle)
 
     train_shuffle = train_sampler is None and config.seed is None
+
     def create_train_data_loader(batch_size_):
         return torch.utils.data.DataLoader(
             train_dataset, batch_size=batch_size_, shuffle=train_shuffle,
@@ -587,13 +640,11 @@ def create_data_loaders(config, train_dataset, val_dataset):
         init_loader = create_train_data_loader(config.batch_size_init)
     else:
         init_loader = deepcopy(train_loader)
-    if config.distributed:
-        init_loader.num_workers = 0  # PyTorch multiprocessing dataloader issue WA
-
     return train_loader, train_sampler, val_loader, init_loader
 
 
-def train_epoch(train_loader, model, criterion, criterion_fn, optimizer, compression_ctrl, epoch, config):
+def train_epoch(train_loader, model, criterion, criterion_fn, optimizer, compression_ctrl, epoch, config,
+                train_iters=None, log_training_info=True):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -601,6 +652,9 @@ def train_epoch(train_loader, model, criterion, criterion_fn, optimizer, compres
     criterion_losses = AverageMeter()
     top1 = AverageMeter()
     top5 = AverageMeter()
+
+    if train_iters is None:
+        train_iters = len(train_loader)
 
     compression_scheduler = compression_ctrl.scheduler
 
@@ -645,7 +699,7 @@ def train_epoch(train_loader, model, criterion, criterion_fn, optimizer, compres
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if i % config.print_freq == 0:
+        if i % config.print_freq == 0 and log_training_info:
             logger.info(
                 '{rank}: '
                 'Epoch: [{0}][{1}/{2}] '
@@ -676,8 +730,11 @@ def train_epoch(train_loader, model, criterion, criterion_fn, optimizer, compres
             for stat_name, stat_value in prepare_for_tensorboard(statistics).items():
                 config.tb.add_scalar('train/statistics/{}'.format(stat_name), stat_value, i + global_step)
 
+        if i >= train_iters:
+            break
 
-def validate(val_loader, model, criterion, config, epoch=0):
+
+def validate(val_loader, model, criterion, config, epoch=0, log_validation_info=True):
     batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
@@ -698,7 +755,7 @@ def validate(val_loader, model, criterion, config, epoch=0):
 
             # measure accuracy and record loss
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
-            losses.update(loss, input_.size(0))
+            losses.update(loss.item(), input_.size(0))
             top1.update(acc1, input_.size(0))
             top5.update(acc5, input_.size(0))
 
@@ -706,7 +763,7 @@ def validate(val_loader, model, criterion, config, epoch=0):
             batch_time.update(time.time() - end)
             end = time.time()
 
-            if i % config.print_freq == 0:
+            if i % config.print_freq == 0 and log_validation_info:
                 logger.info(
                     '{rank}'
                     'Test: [{0}/{1}] '
@@ -719,7 +776,7 @@ def validate(val_loader, model, criterion, config, epoch=0):
                         rank='{}:'.format(config.rank) if config.multiprocessing_distributed else ''
                     ))
 
-        if is_main_process():
+        if is_main_process() and log_validation_info:
             config.tb.add_scalar("val/loss", losses.avg, len(val_loader) * epoch)
             config.tb.add_scalar("val/top1", top1.avg, len(val_loader) * epoch)
             config.tb.add_scalar("val/top5", top5.avg, len(val_loader) * epoch)
@@ -727,13 +784,14 @@ def validate(val_loader, model, criterion, config, epoch=0):
             config.mlflow.safe_call('log_metric', "val/top1", float(top1.avg), epoch)
             config.mlflow.safe_call('log_metric', "val/top5", float(top5.avg), epoch)
 
-        logger.info(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}\n'.format(top1=top1, top5=top5))
+        if log_validation_info:
+            logger.info(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}\n'.format(top1=top1, top5=top5))
 
-        acc = top1.avg / 100
-        if config.metrics_dump is not None:
-            write_metrics(acc, config.metrics_dump)
+            acc = top1.avg / 100
+            if config.metrics_dump is not None:
+                write_metrics(acc, config.metrics_dump)
 
-    return top1.avg, top5.avg
+    return top1.avg, top5.avg, losses.avg
 
 
 class AverageMeter:

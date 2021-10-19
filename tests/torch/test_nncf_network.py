@@ -11,6 +11,7 @@
  limitations under the License.
 """
 import itertools
+from functools import partial
 import os
 from collections import Counter
 from copy import deepcopy
@@ -27,9 +28,9 @@ from torch import nn
 from nncf.common.graph import BaseLayerAttributes
 from nncf.common.graph import NNCFGraph
 from nncf.common.graph import NNCFNode
+from nncf.common.graph import NNCFNodeName
 from nncf.common.graph.definitions import MODEL_INPUT_OP_NAME
 from nncf.common.graph.definitions import MODEL_OUTPUT_OP_NAME
-from nncf.common.graph import NNCFNodeName
 from nncf.common.graph.layer_attributes import ConvolutionLayerAttributes
 from nncf.common.graph.layer_attributes import Dtype
 from nncf.common.graph.transformations.commands import TargetType
@@ -51,8 +52,8 @@ from nncf.torch.graph.operator_metatypes import PT_OPERATOR_METATYPES
 from nncf.torch.graph.operator_metatypes import ReshapeMetatype
 from nncf.torch.graph.transformations.commands import PTInsertionCommand
 from nncf.torch.graph.transformations.commands import PTTargetPoint
-from nncf.torch.graph.patterns import get_full_pattern_graph
 from nncf.torch.graph.transformations.layout import PTTransformationLayout
+from nncf.torch.hardware.fused_patterns import PT_HW_FUSED_PATTERNS
 from nncf.torch.layer_utils import _NNCFModuleMixin
 from nncf.torch.module_operations import BaseOp
 from nncf.torch.nncf_network import EXTERNAL_QUANTIZERS_STORAGE_NAME
@@ -400,10 +401,15 @@ def get_nncf_graph_from_mock_nx_graph(nx_graph: nx.DiGraph) -> PTNNCFGraph:
         for pred_idx, pred in enumerate(preds):
             in_edge = (pred, curr_node_key)
             out_idx, creator_id = edge_vs_output_idx_and_creator_id[in_edge]
+            edge_data = nx_graph.edges[in_edge]
+            if NNCFGraph.DTYPE_EDGE_ATTR in edge_data:
+                dtype = edge_data[NNCFGraph.DTYPE_EDGE_ATTR]
+            else:
+                dtype = Dtype.FLOAT
             mock_graph.add_edge_between_nncf_nodes(creator_id, node_id,
                                                    [1, 1, 1, 1], input_port_id=pred_idx,
                                                    output_port_id=out_idx,
-                                                   dtype=Dtype.FLOAT)
+                                                   dtype=dtype)
 
         for out_idx, out_edge in enumerate(nx_graph.out_edges(curr_node_key)):
             edge_vs_output_idx_and_creator_id[out_edge] = (out_idx, node.node_id)
@@ -728,8 +734,8 @@ class TestInsertionPointGraph:
     def test_get_ip_graph_with_merged_operations(self, mock_graph_factory, dot_file_name):
         mock_graph = mock_graph_factory()
         ip_graph = get_ip_graph_for_test(mock_graph)
-        pattern_graph = get_full_pattern_graph()
-        merged_ip_graph = ip_graph.get_ip_graph_with_merged_hw_optimized_operations(pattern_graph)
+        pattern = PT_HW_FUSED_PATTERNS.get_full_pattern_graph()
+        merged_ip_graph = ip_graph.get_ip_graph_with_merged_hw_optimized_operations(pattern)
 
         data_dir = TEST_ROOT / 'torch/data/reference_graphs/pattern_merging'  # type: Path
 
@@ -790,6 +796,45 @@ def test_get_clean_shallow_copy():
     assert clean_copy.get_graph().get_nodes_count() == clean_copy.get_original_graph().get_nodes_count()
 
 
+class TwoConvTestModelWithUniqueFunction(TwoConvTestModel):
+    def __init__(self):
+        super().__init__()
+        self.unique_attr = 'unique_attr'
+        self.non_unique_attr = 'model_non_unique_attr'
+
+    def train_step(self):
+        pass
+
+    @staticmethod
+    def static_func():
+        pass
+
+
+def test_get_attr():
+    is_called_mock_forward = False
+
+    def mock_forward(*args, **kwargs):
+        nonlocal is_called_mock_forward
+        is_called_mock_forward = True
+
+    model = TwoConvTestModelWithUniqueFunction()
+    config = get_basic_sparsity_plus_quantization_config()
+    register_bn_adaptation_init_args(config)
+    sparse_quantized_model, _ = create_compressed_model_and_algo_for_test(model, config)
+
+    sparse_quantized_model.non_unique_attr = 'NNCFNetwork_non_unique_attr'
+    sparse_quantized_model.forward = mock_forward
+    sparse_quantized_model.forward()
+    assert is_called_mock_forward
+
+    assert hasattr(sparse_quantized_model, 'unique_attr')
+    assert hasattr(sparse_quantized_model, 'non_unique_attr')
+    assert sparse_quantized_model.non_unique_attr == 'NNCFNetwork_non_unique_attr'
+    assert isinstance(sparse_quantized_model.train_step, partial)
+    assert isinstance(sparse_quantized_model.train_step.args[0], NNCFNetwork)
+    assert not isinstance(sparse_quantized_model.static_func, partial)
+
+
 def test_temporary_clean_view():
     model = TwoConvTestModelWithUserModule()
     config = get_basic_sparsity_plus_quantization_config()
@@ -807,8 +852,8 @@ def test_temporary_clean_view():
                intermediate_model.get_original_graph().get_nodes_count()
     sd_after_tmp_clean_view = sparse_quantized_model.state_dict()
     for key in old_sd.keys():
-        assert key in sd_after_tmp_clean_view
-        assert torch.all(torch.eq(sd_after_tmp_clean_view[key], old_sd[key]))
+        assert key in sd_after_tmp_clean_view # pylint: disable=E1135
+        assert torch.all(torch.eq(sd_after_tmp_clean_view[key], old_sd[key])) # pylint: disable=E1136
     sparse_quantized_model.rebuild_graph()
     graph_after_tmp_clean_view = sparse_quantized_model.get_graph()
     assert graph_after_tmp_clean_view == old_graph

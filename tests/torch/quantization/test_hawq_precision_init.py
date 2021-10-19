@@ -17,15 +17,12 @@ from collections import OrderedDict
 from collections import namedtuple
 from functools import partial
 from pathlib import Path
-from typing import Callable
-from typing import Dict
-from typing import List
-from typing import NamedTuple
+from typing import Callable, Dict, List, NamedTuple
 
 import math
 import pytest
 import torch
-import torch.nn as nn
+from torch import nn
 import torch.utils.data
 from numpy.random import random_sample
 from torch.utils import model_zoo
@@ -43,7 +40,7 @@ from nncf.torch.checkpoint_loading import load_state
 from nncf.common.graph import NNCFNodeName
 from nncf.common.hardware.config import HWConfigType
 from nncf.common.quantization.structs import QuantizerGroup
-from nncf.torch.debug import set_debug_log_dir
+from nncf.common.utils.debug import set_debug_log_dir
 from nncf.torch.dynamic_graph.graph_tracer import create_input_infos
 from nncf.torch.initialization import default_criterion_fn
 from nncf.torch.quantization.adjust_padding import add_adjust_padding_nodes
@@ -115,10 +112,10 @@ def get_bitwidth_per_scope(model, all_quantizations=None):
 
 def compare_with_ref_if_exists(actual_state, path_to_ref):
     if os.path.exists(path_to_ref):
-        with open(path_to_ref, 'r') as f:
+        with open(path_to_ref, 'r', encoding='utf8') as f:
             assert json.load(f) == actual_state
     else:
-        with open(path_to_ref, 'w') as f:
+        with open(path_to_ref, 'w', encoding='utf8') as f:
             json.dump(actual_state, f)
 
 
@@ -175,6 +172,7 @@ class BaseConfigBuilder:
 
     def with_target_scope(self, target_scopes=List[str]):
         self._config['target_scopes'] = target_scopes
+        self._config['compression']['target_scopes'] = target_scopes
         self._options['with'] = 'target_scopes'
         return self
 
@@ -247,8 +245,7 @@ class HAWQConfigBuilder(BaseConfigBuilder):
                     'num_init_samples': 1
                 },
                 'batchnorm_adaptation': {
-                    'num_bn_adaptation_samples': 0,
-                    'num_bn_forget_samples': 0
+                    'num_bn_adaptation_samples': 0
                 }
             }})
         return config
@@ -365,7 +362,7 @@ def test_hawq_precision_init(_seed, dataset_dir, tmp_path, mocker, params):
     if not dataset_dir:
         dataset_dir = str(tmp_path)
     train_loader, _ = create_test_dataloaders(config, dataset_dir)
-    config = register_default_init_args(config, train_loader, criterion)
+    config = register_default_init_args(config, train_loader, criterion=criterion)
 
     mocked_trace = mocker.patch('nncf.torch.quantization.hessian_trace.HessianTraceEstimator.get_average_traces',
                                 autospec=True)
@@ -430,7 +427,7 @@ def test_hawq_hw_vpu_config_e2e(_seed, dataset_dir, tmp_path):
     if not dataset_dir:
         dataset_dir = str(tmp_path)
     train_loader, _ = create_test_dataloaders(config, dataset_dir)
-    config = register_default_init_args(config, train_loader, criterion)
+    config = register_default_init_args(config, train_loader, criterion=criterion)
 
     create_compressed_model_and_algo_for_test(model, config)
 
@@ -583,8 +580,8 @@ def precision_init_dumping_worker(gpu, ngpus_per_node, config, tmp_path):
     model = safe_thread_call(partial(mobilenet_v2, pretrained=True))
     model.eval()
     criterion = torch.nn.MSELoss().cuda(config.gpu)
-    config = register_default_init_args(config, data_loader, criterion,
-                                        autoq_eval_fn=lambda *x: 0, autoq_eval_loader=data_loader)
+    config = register_default_init_args(config, data_loader, criterion=criterion,
+                                        autoq_eval_fn=lambda *x: 0, val_loader=data_loader)
     quant_model, compression_ctrl = create_compressed_model_and_algo_for_test(model, config)
 
     quant_model = post_compression_test_distr_init(compression_ctrl, config, ngpus_per_node, quant_model)
@@ -801,11 +798,12 @@ def test_staged_quantization_saves_enabled_quantizers_in_state_dict(tmp_path):
         "weights_quant_start_epoch": 1
     }
     register_bn_adaptation_init_args(config)
-    model_save, ctrl_save = create_compressed_model_and_algo_for_test(BasicConvTestModel(), config)
+    _, ctrl_save = create_compressed_model_and_algo_for_test(BasicConvTestModel(), config)
     ctrl_save.scheduler.epoch_step()
     ctrl_save.scheduler.epoch_step()
+    compression_state = ctrl_save.get_compression_state()
     _, ctrl_load = create_compressed_model_and_algo_for_test(BasicConvTestModel(), config,
-                                                             resuming_state_dict=model_save.state_dict())
+                                                             compression_state=compression_state)
     for quantizer_info in ctrl_load.non_weight_quantizers.values():
         assert not quantizer_info.quantizer_module_ref.is_enabled_quantization()
     for quantizer_info in ctrl_load.weight_quantizers.values():

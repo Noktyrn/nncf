@@ -12,28 +12,32 @@
 """
 
 import json
-import os
 import shlex
 import sys
-import tempfile
-from enum import Enum
-from enum import auto
 from pathlib import Path
 from typing import Dict
 
+import os
 import pytest
+import tempfile
 import torch
+from enum import Enum
+from enum import auto
+from pytest_dependency import depends
 
 # pylint: disable=redefined-outer-name
+from examples.torch.common.model_loader import COMPRESSION_STATE_ATTR
+
 from examples.torch.common.optimizer import get_default_weight_decay
 from examples.torch.common.sample_config import SampleConfig
 from examples.torch.common.utils import get_name
 from examples.torch.common.utils import is_staged_quantization
 from nncf.api.compression import CompressionStage
+from nncf.common.compression import BaseControllerStateNames
+from nncf.common.compression import BaseCompressionAlgorithmController as BaseController
 from nncf.common.hardware.config import HWConfigType
 from nncf.common.quantization.structs import QuantizerConfig
 from nncf.config import NNCFConfig
-from pytest_dependency import depends
 from tests.common.helpers import EXAMPLES_DIR
 from tests.common.helpers import PROJECT_ROOT
 from tests.common.helpers import TEST_ROOT
@@ -50,7 +54,7 @@ class ConfigFactory:
         self.config_path = str(config_path)
 
     def serialize(self):
-        with open(self.config_path, 'w') as f:
+        with open(self.config_path, 'w', encoding='utf8') as f:
             json.dump(self.config, f)
         return self.config_path
 
@@ -83,10 +87,14 @@ CONFIGS = {
                        TEST_ROOT.joinpath("torch", "data", "configs", "inception_v3_mock_dataset.json"),
                        TEST_ROOT.joinpath("torch", "data", "configs", "resnet18_cifar100_bin_xnor.json"),
                        TEST_ROOT.joinpath("torch", "data", "configs", "resnet18_cifar10_staged_quant.json"),
-                       TEST_ROOT.joinpath("torch", "data", "configs", "resnet18_pruning_magnitude.json")],
+                       TEST_ROOT.joinpath("torch", "data", "configs", "resnet18_pruning_magnitude.json"),
+                       TEST_ROOT.joinpath("torch", "data", "configs", "resnet18_pruning_learned_ranking.json"),
+                       TEST_ROOT.joinpath("torch", "data", "configs", "resnet18_pruning_accuracy_aware.json"),
+                       TEST_ROOT.joinpath("torch", "data", "configs", "resnet18_int8_accuracy_aware.json")],
     "semantic_segmentation": [TEST_ROOT.joinpath("torch", "data", "configs", "unet_camvid_int8.json"),
                               TEST_ROOT.joinpath("torch", "data", "configs", "unet_camvid_rb_sparsity.json")],
-    "object_detection": [TEST_ROOT.joinpath("torch", "data", "configs", "ssd300_vgg_voc_int8.json")]
+    "object_detection": [TEST_ROOT.joinpath("torch", "data", "configs", "ssd300_vgg_voc_int8.json"),
+                         TEST_ROOT.joinpath("torch", "data", "configs", "ssd300_vgg_voc_int8_accuracy_aware.json")]
 }
 
 BATCHSIZE_PER_GPU = {
@@ -112,7 +120,7 @@ DATASET_PATHS = {
     },
 }
 
-CONFIG_PARAMS = list()
+CONFIG_PARAMS = []
 for sample_type in SAMPLE_TYPES:
     for tpl in list(zip(CONFIGS[sample_type], DATASETS[sample_type], BATCHSIZE_PER_GPU[sample_type])):
         CONFIG_PARAMS.append((sample_type,) + tpl)
@@ -122,14 +130,35 @@ def update_compression_algo_dict_with_reduced_bn_adapt_params(algo_dict):
     if algo_dict["algorithm"] == "rb_sparsity":
         return
     if 'initializer' not in algo_dict:
-        algo_dict['initializer'] = {'batchnorm_adaptation': {'num_bn_adaptation_samples': 5,
-                                                             'num_bn_forget_samples': 5}}
+        algo_dict['initializer'] = {'batchnorm_adaptation': {'num_bn_adaptation_samples': 5}}
     else:
-        algo_dict['initializer'].update({'batchnorm_adaptation': {'num_bn_adaptation_samples': 5,
-                                                                  'num_bn_forget_samples': 5}})
+        algo_dict['initializer'].update({'batchnorm_adaptation': {'num_bn_adaptation_samples': 5}})
+
+
+def update_compression_algo_dict_with_legr_save_load_params(nncf_config, tmp_path, save=True):
+    if 'compression' not in nncf_config:
+        return nncf_config
+    if isinstance(nncf_config["compression"], list):
+        algos_list = nncf_config["compression"]
+    else:
+        algos_list = [nncf_config["compression"]]
+
+    for algo_dict in algos_list:
+        if algo_dict["algorithm"] != "filter_pruning":
+            continue
+
+        if "interlayer_ranking_type" in algo_dict['params'] and algo_dict['params'][
+            "interlayer_ranking_type"] == 'learned_ranking':
+            if save:
+                algo_dict['params']['save_ranking_coeffs_path'] = os.path.join(tmp_path, 'ranking_coeffs.json')
+            else:
+                algo_dict['params']['load_ranking_coeffs_path'] = os.path.join(tmp_path, 'ranking_coeffs.json')
+    return nncf_config
+
 
 def _get_test_case_id(p) -> str:
     return "-".join([p[0], p[1].name, p[2], str(p[3])])
+
 
 @pytest.fixture(params=CONFIG_PARAMS,
                 ids=[_get_test_case_id(p) for p in CONFIG_PARAMS])
@@ -152,7 +181,6 @@ def config(request, dataset_dir):
         else:
             algo_dict = jconfig["compression"]
             update_compression_algo_dict_with_reduced_bn_adapt_params(algo_dict)
-
     jconfig["dataset"] = dataset_name
 
     return {
@@ -168,15 +196,19 @@ def config(request, dataset_dir):
 @pytest.fixture(scope="module")
 def case_common_dirs(tmp_path_factory):
     return {
-        "checkpoint_save_dir": str(tmp_path_factory.mktemp("models"))
+        "checkpoint_save_dir": str(tmp_path_factory.mktemp("models")),
+        "save_coeffs_path": str(tmp_path_factory.mktemp("ranking_coeffs")),
     }
 
 
 @pytest.mark.parametrize(" multiprocessing_distributed",
                          (True, False),
                          ids=['distributed', 'dataparallel'])
-def test_pretrained_model_eval(config, tmp_path, multiprocessing_distributed):
+def test_pretrained_model_eval(config, tmp_path, multiprocessing_distributed, case_common_dirs):
     config_factory = ConfigFactory(config['nncf_config'], tmp_path / 'config.json')
+    config_factory.config = update_compression_algo_dict_with_legr_save_load_params(config_factory.config,
+                                                                                    case_common_dirs[
+                                                                                        'save_coeffs_path'])
     args = {
         "--mode": "test",
         "--data": config["dataset_path"],
@@ -204,6 +236,10 @@ def test_pretrained_model_train(config, tmp_path, multiprocessing_distributed, c
     checkpoint_save_dir = os.path.join(case_common_dirs["checkpoint_save_dir"],
                                        "distributed" if multiprocessing_distributed else "data_parallel")
     config_factory = ConfigFactory(config['nncf_config'], tmp_path / 'config.json')
+    config_factory.config = update_compression_algo_dict_with_legr_save_load_params(config_factory.config,
+                                                                                    case_common_dirs[
+                                                                                        'save_coeffs_path'])
+
     args = {
         "--mode": "train",
         "--data": config["dataset_path"],
@@ -233,7 +269,8 @@ def test_pretrained_model_train(config, tmp_path, multiprocessing_distributed, c
         allowed_compression_stages = (CompressionStage.FULLY_COMPRESSED, CompressionStage.PARTIALLY_COMPRESSED)
     else:
         allowed_compression_stages = (CompressionStage.UNCOMPRESSED,)
-    assert torch.load(last_checkpoint_path)['compression_stage'] in allowed_compression_stages
+    compression_stage = extract_compression_stage_from_checkpoint(last_checkpoint_path)
+    assert compression_stage in allowed_compression_stages
 
 
 def depends_on_pretrained_train(request, test_case_id: str, current_multiprocessing_distributed: bool):
@@ -249,6 +286,10 @@ def depends_on_pretrained_train(request, test_case_id: str, current_multiprocess
 def test_trained_model_eval(request, config, tmp_path, multiprocessing_distributed, case_common_dirs):
     depends_on_pretrained_train(request, config["test_case_id"], multiprocessing_distributed)
     config_factory = ConfigFactory(config['nncf_config'], tmp_path / 'config.json')
+    config_factory.config = update_compression_algo_dict_with_legr_save_load_params(config_factory.config,
+                                                                                    case_common_dirs[
+                                                                                        'save_coeffs_path'])
+
     ckpt_path = os.path.join(case_common_dirs["checkpoint_save_dir"],
                              "distributed" if multiprocessing_distributed else "data_parallel",
                              get_name(config_factory.config) + "_last.pth")
@@ -286,6 +327,10 @@ def test_resume(request, config, tmp_path, multiprocessing_distributed, case_com
     depends_on_pretrained_train(request, config["test_case_id"], multiprocessing_distributed)
     checkpoint_save_dir = os.path.join(str(tmp_path), "models")
     config_factory = ConfigFactory(config['nncf_config'], tmp_path / 'config.json')
+    config_factory.config = update_compression_algo_dict_with_legr_save_load_params(config_factory.config,
+                                                                                    case_common_dirs[
+                                                                                        'save_coeffs_path'], False)
+
     ckpt_path = get_resuming_checkpoint_path(config_factory, multiprocessing_distributed,
                                              case_common_dirs["checkpoint_save_dir"])
     if "max_iter" in config_factory.config:
@@ -316,7 +361,15 @@ def test_resume(request, config, tmp_path, multiprocessing_distributed, case_com
         allowed_compression_stages = (CompressionStage.FULLY_COMPRESSED, CompressionStage.PARTIALLY_COMPRESSED)
     else:
         allowed_compression_stages = (CompressionStage.UNCOMPRESSED,)
-    assert torch.load(last_checkpoint_path)['compression_stage'] in allowed_compression_stages
+    compression_stage = extract_compression_stage_from_checkpoint(last_checkpoint_path)
+    assert compression_stage in allowed_compression_stages
+
+
+def extract_compression_stage_from_checkpoint(last_checkpoint_path):
+    compression_state = torch.load(last_checkpoint_path)[COMPRESSION_STATE_ATTR]
+    ctrl_state = compression_state[BaseController.CONTROLLER_STATE]
+    compression_stage = next(iter(ctrl_state.values()))[BaseControllerStateNames.COMPRESSION_STAGE]
+    return compression_stage
 
 
 @pytest.mark.dependency()
@@ -326,12 +379,16 @@ def test_resume(request, config, tmp_path, multiprocessing_distributed, case_com
 def test_export_with_resume(request, config, tmp_path, multiprocessing_distributed, case_common_dirs):
     depends_on_pretrained_train(request, config["test_case_id"], multiprocessing_distributed)
     config_factory = ConfigFactory(config['nncf_config'], tmp_path / 'config.json')
+    config_factory.config = update_compression_algo_dict_with_legr_save_load_params(config_factory.config,
+                                                                                    case_common_dirs[
+                                                                                        'save_coeffs_path'], False)
+
     ckpt_path = get_resuming_checkpoint_path(config_factory, multiprocessing_distributed,
                                              case_common_dirs["checkpoint_save_dir"])
 
     onnx_path = os.path.join(str(tmp_path), "model.onnx")
     args = {
-        "--mode": "test",
+        "--mode": "export",
         "--config": config_factory.serialize(),
         "--resume": ckpt_path,
         "--to-onnx": onnx_path
@@ -360,7 +417,7 @@ def test_export_with_pretrained(tmp_path):
 
     onnx_path = os.path.join(str(tmp_path), "model.onnx")
     args = {
-        "--mode": "test",
+        "--mode": "export",
         "--config": config_factory.serialize(),
         "--pretrained": '',
         "--to-onnx": onnx_path
@@ -408,11 +465,11 @@ def test_cpu_only_mode_produces_cpu_only_model(config, tmp_path, mocker):
             mocker.patch("examples.torch.classification.staged_quantization_worker.train_epoch_staged")
             mocker.patch("examples.torch.classification.staged_quantization_worker.validate")
             import examples.torch.classification.staged_quantization_worker as staged_worker
-            staged_worker.validate.return_value = (0, 0)
+            staged_worker.validate.return_value = (0, 0, 0)
         else:
             mocker.patch("examples.torch.classification.main.train_epoch")
             mocker.patch("examples.torch.classification.main.validate")
-            sample.validate.return_value = (0, 0)
+            sample.validate.return_value = (0, 0, 0)
     elif config["sample_type"] == "semantic_segmentation":
         import examples.torch.semantic_segmentation.main as sample
         import examples.torch.semantic_segmentation.train
@@ -420,7 +477,6 @@ def test_cpu_only_mode_produces_cpu_only_model(config, tmp_path, mocker):
     elif config["sample_type"] == "object_detection":
         import examples.torch.object_detection.main as sample
         mocker.spy(sample, "train")
-
 
     sample.main(shlex.split(command_line))
 
@@ -512,8 +568,7 @@ class TestCaseDescriptor:
                         "num_init_samples": 2
                     },
                     "batchnorm_adaptation": {
-                        "num_bn_adaptation_samples": 1,
-                        "num_bn_forget_samples": 1
+                        "num_bn_adaptation_samples": 1
                     }
                 },
                 'params': self.quantization_algo_params,
@@ -608,7 +663,7 @@ class AutoQDescriptor(TestCaseDescriptor):
         ctrl = self.builder_spy.spy_return
         final_bits = [qm.num_bits for qm in ctrl.all_quantizations.values()]
         assert set(final_bits) != {QuantizerConfig().num_bits}
-        assert all([bit in AutoQDescriptor.BITS for bit in final_bits])
+        assert all(bit in AutoQDescriptor.BITS for bit in final_bits)
 
 
 def resnet18_desc(x: TestCaseDescriptor):
@@ -741,3 +796,68 @@ def test_sample_propagates_target_device_cl_param_to_nncf_config(mocker, tmp_pat
 
     config = start_worker_mock.call_args[0][1].nncf_config
     assert config["target_device"] == target_device
+
+
+@pytest.fixture(params=[TEST_ROOT.joinpath("torch", "data", "configs", "resnet18_pruning_accuracy_aware.json"),
+                        TEST_ROOT.joinpath("torch", "data", "configs", "resnet18_int8_accuracy_aware.json")])
+def accuracy_aware_config(request):
+    config_path = request.param
+    with config_path.open() as f:
+        jconfig = json.load(f)
+
+    dataset_name = 'mock_32x32'
+    TEST_ROOT.joinpath("torch", "data", "mock_datasets", dataset_name)
+    dataset_path = os.path.join('/tmp', 'mock_32x32')
+    sample_type = 'classification'
+
+    jconfig["dataset"] = dataset_name
+
+    return {
+        "sample_type": sample_type,
+        'nncf_config': jconfig,
+        "model_name": jconfig["model"],
+        "dataset_path": dataset_path,
+        "batch_size": 12,
+    }
+
+
+@pytest.mark.dependency()
+@pytest.mark.parametrize(
+    "multiprocessing_distributed", [True, False],
+    ids=['distributed', 'dataparallel'])
+def test_accuracy_aware_training_pipeline(accuracy_aware_config, tmp_path, multiprocessing_distributed):
+    config_factory = ConfigFactory(accuracy_aware_config['nncf_config'], tmp_path / 'config.json')
+
+    args = {
+        "--mode": "train",
+        "--data": accuracy_aware_config["dataset_path"],
+        "--config": config_factory.serialize(),
+        "--log-dir": tmp_path,
+        "--batch-size": accuracy_aware_config["batch_size"] * NUM_DEVICES,
+        "--workers": 0,  # Workaround for the PyTorch MultiProcessingDataLoader issue
+        "--epochs": 2,
+        "--dist-url": "tcp://127.0.0.1:8989"
+    }
+
+    if not torch.cuda.is_available():
+        args["--cpu-only"] = True
+    elif multiprocessing_distributed:
+        args["--multiprocessing-distributed"] = True
+
+    runner = Command(create_command_line(args, accuracy_aware_config["sample_type"]))
+    runner.run()
+
+    from glob import glob
+    time_dir_1 = glob(os.path.join(tmp_path, get_name(config_factory.config), '*/'))[0].split('/')[-2]
+    time_dir_2 = glob(os.path.join(tmp_path, get_name(config_factory.config), time_dir_1,
+                      'accuracy_aware_training', '*/'))[0].split('/')[-2]
+    last_checkpoint_path = os.path.join(tmp_path, get_name(config_factory.config), time_dir_1,
+                                        'accuracy_aware_training',
+                                        time_dir_2, 'acc_aware_checkpoint_last.pth')
+    assert os.path.exists(last_checkpoint_path)
+    if 'compression' in accuracy_aware_config['nncf_config']:
+        allowed_compression_stages = (CompressionStage.FULLY_COMPRESSED, CompressionStage.PARTIALLY_COMPRESSED)
+    else:
+        allowed_compression_stages = (CompressionStage.UNCOMPRESSED,)
+    compression_stage = extract_compression_stage_from_checkpoint(last_checkpoint_path)
+    assert compression_stage in allowed_compression_stages

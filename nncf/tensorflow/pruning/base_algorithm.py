@@ -29,7 +29,8 @@ from nncf.common.pruning.statistics import PrunedLayerSummary
 from nncf.common.pruning.statistics import PrunedModelStatistics
 from nncf.common.pruning.structs import PrunedLayerInfoBase
 from nncf.common.utils.logger import logger as nncf_logger
-from nncf.tensorflow.api.compression import TFCompressionAlgorithmController
+from nncf.common.compression import BaseCompressionAlgorithmController
+from nncf.config.extractors import extract_algo_specific_config
 from nncf.tensorflow.api.compression import TFCompressionAlgorithmBuilder
 from nncf.tensorflow.graph.converter import TFModelConverterFactory
 from nncf.tensorflow.graph.metatypes.keras_layers import TFBatchNormalizationLayerMetatype
@@ -62,10 +63,8 @@ class BasePruningAlgoBuilder(TFCompressionAlgorithmBuilder):
 
     def __init__(self, config: NNCFConfig, should_init: bool = True):
         super().__init__(config, should_init)
-        params = config.get('params', {})
+        params = self._algo_config.get('params', {})
         self._params = params
-        self.ignored_scopes = self.config.get('ignored_scopes', [])
-        self.target_scopes = self.config.get('target_scopes')
 
         self._ignore_frozen_layers = True
         self._prune_first = params.get('prune_first_conv', False)
@@ -155,7 +154,7 @@ class BasePruningAlgoBuilder(TFCompressionAlgorithmBuilder):
         mask_propagator = MaskPropagationAlgorithm(self._graph, TF_PRUNING_OPERATOR_METATYPES)
         mask_propagator.mask_propagation()
 
-        # Add masks for all spec modules, because prunable batchnorm layers can be determines
+        # Add masks for all spec modules, because prunable batchnorm layers can be determined
         # at the moment of mask propagation
         types_spec_layers = [TFBatchNormalizationLayerMetatype] \
             if self._prune_batch_norms else []
@@ -163,6 +162,7 @@ class BasePruningAlgoBuilder(TFCompressionAlgorithmBuilder):
         spec_nodes = self._graph.get_nodes_by_metatypes(types_spec_layers)
         for spec_node in spec_nodes:
             layer_name = get_layer_identifier(spec_node)
+            layer = model.get_layer(layer_name)
             if spec_node.data['output_mask'] is None:
                 # Skip elements that will not be pruned
                 continue
@@ -174,6 +174,12 @@ class BasePruningAlgoBuilder(TFCompressionAlgorithmBuilder):
 
             _, layer_info = converter.get_layer_info_for_node(spec_node.node_name)
             for weight_def in spec_node.metatype.weight_definitions:
+                if spec_node.metatype is TFBatchNormalizationLayerMetatype \
+                        and not layer.scale and weight_def.weight_attr_name == 'gamma':
+                    nncf_logger.debug('Fused gamma parameter encountered in BatchNormalization layer. '
+                                      'Do not add mask to it.')
+                    continue
+
                 transformations.register(
                     self._get_insertion_command_binary_mask(
                         layer_info.layer_name, weight_def.weight_attr_name)
@@ -216,7 +222,7 @@ class BasePruningAlgoBuilder(TFCompressionAlgorithmBuilder):
         Note: Single node per layer for shared bactchnorm layers
         """
         layer_nodes = [node_ for node_ in group.elements
-                       if get_layer_identifier(node_) == layer_name]
+                       if node_.layer_name == layer_name]
         bn_nodes = []
         bn_layer_names = []
         for layer_node in layer_nodes:
@@ -247,7 +253,7 @@ class BasePruningAlgoBuilder(TFCompressionAlgorithmBuilder):
         return f'{layer_name}_{weight_attr_name}_pruning_binary_mask'
 
 
-class BasePruningAlgoController(TFCompressionAlgorithmController):
+class BasePruningAlgoController(BaseCompressionAlgorithmController):
     """
     Serves as a handle to the additional modules, parameters and hooks inserted
     into the original uncompressed model to enable pruning.
@@ -263,8 +269,10 @@ class BasePruningAlgoController(TFCompressionAlgorithmController):
         self._op_names = op_names
         self._prunable_types = prunable_types
         self.config = config
-        params = self.config.get('params', {})
-        self.pruning_init = config.get('pruning_init', 0)
+        self.pruning_config = extract_algo_specific_config(config,
+                                                           "filter_pruning")
+        params = self.pruning_config.get('params', {})
+        self.pruning_init = self.pruning_config.get('pruning_init', 0)
         self.pruning_rate = self.pruning_init
         self._pruned_layer_groups_info = pruned_layer_groups_info
         self.prune_flops = False
@@ -319,11 +327,8 @@ class BasePruningAlgoController(TFCompressionAlgorithmController):
 
         pruned_layers_summary = []
         for mask_name, weights_shape, mask_shape, pruning_rate in mask_pruning:
-            # TODO(andrey-churkin): Should be calculated
-            weight_pruning_level = -1
-            mask_pruning_level = -1
-            pruned_layers_summary.append(PrunedLayerSummary(mask_name, weights_shape, mask_shape,
-                                                            weight_pruning_level, mask_pruning_level, pruning_rate))
+            pruned_layers_summary.append(PrunedLayerSummary(mask_name, weights_shape,
+                                                            mask_shape, pruning_rate))
 
         return PrunedModelStatistics(self.pruning_rate, pruned_layers_summary)
 

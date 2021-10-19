@@ -11,6 +11,7 @@
  limitations under the License.
 """
 
+import copy
 import torch
 from torch import nn
 
@@ -410,6 +411,58 @@ class PruningTestModelSharedConvs(nn.Module):
         out1 = self.conv2(in1)
         out2 = self.conv2(in2)
         return self.conv3(out1), self.conv3(out2)
+
+
+class DisconectedGraphModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = create_conv(1, 16, 1, 1, -2)
+        for i in range(16):
+            self.conv1.weight.data[i] += i
+        self.conv2 = create_conv(16, 16, 1, 1, -2)
+        for i in range(16):
+            self.conv2.weight.data[i] += i
+        self.conv3 = create_conv(16, 1, 1, 1, -2)
+        self.relu = nn.ReLU()
+        self.fc = nn.Linear(64, 3)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        # Broke tracing graph by copy function
+        x = copy.copy(x)
+        x = self.relu(x)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        x = x.view(-1, 64)
+        x = self.fc(x)
+        # Broke tracing graph by copy function
+        x = copy.copy(x)
+        return x
+
+
+class DepthwiseConvolutionModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = create_conv(1, 512, 1, 1, 1)
+        self.conv4 = create_conv(1024, 512, 2, 1, 1)
+        for i in range(512):
+            self.conv1.weight.data[i] += i
+            self.conv4.weight.data[i] += i
+        self.conv2 = create_conv(512, 1024, 3, 1, 1)
+        self.conv3 = create_conv(512, 1024, 3, 1, 1)
+        self.depthwise_conv = create_depthwise_conv(1024, 5, 1, 1)
+        for i in range(1024):
+            self.conv2.weight.data[i] += i
+            self.conv3.weight.data[i] += i
+            self.depthwise_conv.weight.data[i] += i
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x1 = self.conv2(x)
+        x2 = self.conv3(x)
+        x = x1 + x2
+        x = self.depthwise_conv(x)
+        return self.conv4(x)
 
 
 def get_basic_pruning_config(input_sample_size=None) -> NNCFConfig:

@@ -50,8 +50,7 @@ CONFIG_WITH_ALL_INIT_TYPES = {
                     'num_init_samples': 1
                 },
                 'batchnorm_adaptation': {
-                    'num_bn_adaptation_samples': 5,
-                    'num_bn_forget_samples': 0
+                    'num_bn_adaptation_samples': 5
                 }
             }
         }
@@ -68,7 +67,7 @@ def nncf_config_with_default_init_args_(mocker):
     mocker_criterion = mocker.stub()
     mocker_criterion.batch_size = 1
 
-    config = register_default_init_args(config, train_loader, mocker_criterion)
+    config = register_default_init_args(config, train_loader, criterion=mocker_criterion)
     return config
 
 

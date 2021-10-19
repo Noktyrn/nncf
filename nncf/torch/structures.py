@@ -10,9 +10,10 @@
  See the License for the specific language governing permissions and
  limitations under the License.
 """
-from typing import Callable, Any
+from typing import Callable, Any, Optional, Tuple
 
 import torch
+from torch import nn
 from torch.nn.modules.loss import _Loss
 from torch.utils.data import DataLoader
 
@@ -76,3 +77,67 @@ class AutoQPrecisionInitArgs(NNCFExtraConfigStruct):
     @classmethod
     def get_id(cls) -> str:
         return "autoq_precision_init_args"
+
+
+class LeGRInitArgs(NNCFExtraConfigStruct):
+    """
+    Stores arguments for learning global ranking in pruning algorithm.
+    :param train_loader: provides an iterable over the given training (or initialising) dataset.
+    :param train_fn: callable for training compressed model. Train model for one epoch or train_steps (if specified) by
+    given args: [dataloader, model, optimizer, compression algorithm controller, train_steps number].
+    :param val_loader: provides an iterable over the given validation dataset.
+    :param val_fn: callable to validate model, calculates pair of validation [acc, loss] by given model and dataloader.
+    :param train_optimizer: optional, optimizer for model training.
+    :param nncf_config: NNCF config for compression.
+    """
+    def __init__(self,
+                 train_loader: torch.utils.data.DataLoader,
+                 train_fn: Callable[[torch.utils.data.DataLoader, torch.nn.Module,
+                                     torch.optim.Optimizer, 'CompressionAlgorithmController',
+                                     Optional[int]], type(None)],
+                 val_loader: torch.utils.data.DataLoader,
+                 val_fn: Callable[[torch.nn.Module, torch.utils.data.DataLoader],
+                                  Tuple[float, float]],
+                 train_optimizer: Optional[torch.optim.Optimizer],
+                 nncf_config: 'NNCFConfig'):
+        self.train_loader = train_loader
+        self.train_steps_fn = train_fn
+        self.val_loader = val_loader
+        self.val_fn = val_fn
+        self.train_optimizer = train_optimizer
+        self.config = nncf_config
+
+    @classmethod
+    def get_id(cls) -> str:
+        return "legr_init_args"
+
+
+class DistributedCallbacksArgs(NNCFExtraConfigStruct):
+    """
+    A pair of callbacks that is needed for distributed training of the model: wrapping model with wrapping_callback for
+    distributed training, and after all training steps unwrapping model to the initial not-distributed state with
+    unwrapping_callback.
+    :param wrapping_callback: Callback that wraps the model for distributed training with any necessary structure (for
+    example, torch.nn.DataParallel or any custom class), returns wrapped model ready for distributed training
+    :param unwrapping_callback: Callback for unwrapping the model wrapped with wrapping_callback, returns original model
+    """
+    def __init__(self,
+                 wrapping_callback: Callable[[nn.Module], nn.Module],
+                 unwrapping_callback: Callable[[nn.Module], nn.Module]):
+        self.wrap_model = wrapping_callback
+        self.unwrap_model = unwrapping_callback
+
+    @classmethod
+    def get_id(cls) -> str:
+        return "distributed_callbacks_args"
+
+
+class ExecutionParameters:
+    """
+    Parameters that are necessary for distributed training of the model.
+    :param cpu_only: whether cpu-only mode is using for training
+    :param current_gpu: id of GPU that should be used for training (if only one of all is used)
+    """
+    def __init__(self, cpu_only: bool, current_gpu: Optional[int]):
+        self.cpu_only = cpu_only
+        self.current_gpu = current_gpu

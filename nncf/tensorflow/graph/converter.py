@@ -268,7 +268,8 @@ class TFModelConverter(ABC):
     def _get_layer_dtype(layer_config: Dict) -> str:
         dtype = layer_config['config']['dtype']
         if layer_config['class_name'] == 'TensorFlowOpLayer':
-            dtype = layer_config['config']['node_def'].get('attr', {}).get('T', {}).get('type') or dtype
+            attrs = layer_config['config']['node_def'].get('attr', {})
+            dtype = attrs.get('DstT', {}).get('type') or attrs.get('T', {}).get('type') or dtype
         return dtype
 
     @staticmethod
@@ -554,7 +555,7 @@ class FunctionalConverter(TFModelConverter):
             # output nodes without changing the name of the corresponding output, which won't be obvious to the user.
             nncf_node = nncf_graph.get_node_by_id(output_node_id)
             if not nncf_graph.get_next_nodes(nncf_node):
-                output_aux_node_name = PREFIX_AUXILIARY_OUTPUT_NODE + '_{}'.format(model_output_idx)
+                output_aux_node_name = f'{nncf_node.node_name}_{PREFIX_AUXILIARY_OUTPUT_NODE}_{model_output_idx}'
                 output_node = nncf_graph.add_nncf_node(
                     node_name=output_aux_node_name,
                     node_type=NNCFGraphNodeType.OUTPUT_NODE,

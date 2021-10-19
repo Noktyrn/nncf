@@ -18,14 +18,15 @@ import tempfile
 
 import pytest
 import torch
+from copy import deepcopy
 from pytest import approx
 
 from examples.torch.common.utils import get_name
 from tests.common.helpers import TEST_ROOT
 from tests.torch.helpers import Command
 from tests.common.helpers import get_cli_dict_args
-from tests.torch.test_sanity_sample import create_command_line
-
+from tests.torch.test_sanity_sample import create_command_line, update_compression_algo_dict_with_legr_save_load_params
+# pylint: disable=redefined-outer-name
 # sample
 # ├── dataset
 # │   ├── path
@@ -80,7 +81,14 @@ GLOBAL_CONFIG = {
                             'weights': 'mobilenet_v2_32x32_cifar100_68.11.pth',
                             'execution_arg': {'multiprocessing-distributed'},
                             'absolute_tolerance_eval': 2e-2
-                        }
+                        },
+                        'mobilenet_v2_learned_ranking.json': {
+                            'execution_arg': {'multiprocessing-distributed'},
+                            'expected_accuracy': 68.11,
+                            'weights': 'mobilenet_v2_32x32_cifar100_68.11.pth',
+                            'absolute_tolerance_train': 1.0,
+                            'absolute_tolerance_eval': 2e-2
+                        },
                     }
                 },
             'imagenet':
@@ -110,6 +118,18 @@ GLOBAL_CONFIG = {
 }
 
 
+def update_compression_config_with_legr_save_load_params(nncf_config_path, tmp_path, save=True):
+    with open(nncf_config_path, 'r', encoding='utf8') as f:
+        nncf_config = json.load(f)
+    updated_nncf_config = update_compression_algo_dict_with_legr_save_load_params(deepcopy(nncf_config), tmp_path, save)
+    new_nncf_config_path = nncf_config_path
+    if updated_nncf_config != nncf_config:
+        new_nncf_config_path = os.path.join(tmp_path, os.path.basename(nncf_config_path))
+        with open(str(new_nncf_config_path), 'w', encoding='utf8') as f:
+            json.dump(updated_nncf_config, f)
+    return new_nncf_config_path
+
+
 def parse_best_acc1(tmp_path):
     output_path = None
     for root, _, names in os.walk(str(tmp_path)):
@@ -118,7 +138,7 @@ def parse_best_acc1(tmp_path):
                 output_path = os.path.join(root, name)
 
     assert os.path.exists(output_path)
-    with open(output_path, "r") as f:
+    with open(output_path, "r", encoding='utf8') as f:
         for line in reversed(f.readlines()):
             if line != '\n':
                 matches = re.findall("\\d+\\.\\d+", line)
@@ -129,14 +149,12 @@ def parse_best_acc1(tmp_path):
     raise RuntimeError("Could not parse output log for accuracy!")
 
 
-
 CONFIG_PARAMS = []
-for sample_type_ in GLOBAL_CONFIG:
-    datasets = GLOBAL_CONFIG[sample_type_]
-    for dataset_name_ in datasets:
-        dataset_path = datasets[dataset_name_].get('path', os.path.join(tempfile.gettempdir(), dataset_name_))
-        batch_size = datasets[dataset_name_].get('batch', None)
-        configs = datasets[dataset_name_].get('configs', {})
+for sample_type_, datasets in GLOBAL_CONFIG.items():
+    for dataset_name_, dataset in datasets.items():
+        dataset_path = dataset.get('path', os.path.join(tempfile.gettempdir(), dataset_name_))
+        batch_size = dataset.get('batch', None)
+        configs = dataset.get('configs', {})
         for config_name in configs:
             config_params = configs[config_name]
             execution_args = config_params.get('execution_arg', [''])
@@ -206,11 +224,21 @@ def _params(request, tmp_path_factory, dataset_dir, weekly_models_path, enable_i
     }
 
 
+@pytest.fixture(scope="module")
+def case_common_dirs(tmp_path_factory):
+    return {
+        "save_coeffs_path": str(tmp_path_factory.mktemp("ranking_coeffs")),
+    }
+
+
 @pytest.mark.dependency(name="train")
-def test_compression_train(_params, tmp_path):
+def test_compression_train(_params, tmp_path, case_common_dirs):
     p = _params
     args = p['args']
     tc = p['test_config']
+
+    args['config'] = update_compression_config_with_legr_save_load_params(args['config'],
+                                                                          case_common_dirs["save_coeffs_path"])
 
     args['mode'] = 'train'
     args['log-dir'] = tmp_path
@@ -233,11 +261,13 @@ def test_compression_train(_params, tmp_path):
 
 
 @pytest.mark.dependency(depends=["train"])
-def test_compression_eval_trained(_params, tmp_path):
+def test_compression_eval_trained(_params, tmp_path, case_common_dirs):
     p = _params
     args = p['args']
     tc = p['test_config']
 
+    args['config'] = update_compression_config_with_legr_save_load_params(args['config'],
+                                                                          case_common_dirs["save_coeffs_path"], False)
     args['mode'] = 'test'
     args['log-dir'] = tmp_path
     args['workers'] = 0  # Workaround for PyTorch MultiprocessingDataLoader issues
@@ -257,7 +287,7 @@ def test_compression_eval_trained(_params, tmp_path):
     runner.kwargs.update(env=env_with_cuda_reproducibility)
     runner.run(timeout=tc['timeout'])
 
-    with open(str(METRIC_FILE_PATH)) as metric_file:
+    with open(str(METRIC_FILE_PATH), encoding='utf8') as metric_file:
         metrics = json.load(metric_file)
     acc1 = metrics['Accuracy']
     assert torch.load(checkpoint_path)['best_acc1'] == approx(acc1, abs=tc['absolute_tolerance_eval'])
