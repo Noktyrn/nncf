@@ -141,7 +141,7 @@ def main_worker(current_gpu, config: SampleConfig):
     criterion = criterion.to(config.device)
 
     model_name = config['model']
-    train_criterion_fn = inception_criterion_fn if 'inception' in model_name else googlenet_criterion_fn if 'googlenet' in model_name else default_criterion_fn
+    train_criterion_fn = inception_criterion_fn if 'inception' in model_name else default_criterion_fn
 
     train_loader = train_sampler = val_loader = None
     resuming_checkpoint_path = config.resuming_checkpoint_path
@@ -196,6 +196,7 @@ def main_worker(current_gpu, config: SampleConfig):
     pruned_filters = compression_ctrl.get_pruned_filters_dict()
 
     train_step2(config, model, criterion, train_criterion_fn, reg_optimizer, train_loader, pruned_filters, t_start=0.01)
+
     #MY CODE ENDS
 
     if config.to_onnx:
@@ -290,7 +291,12 @@ def compare_layers(name, param_name):
         open_br = name_tokens[i].index('[')
         cl_br = name_tokens[i].index(']')
         name_tokens[i] = name_tokens[i][open_br+1:cl_br]
-    return set(name_tokens[:-1]) == set(param_tokens)
+    
+    name_tokens = name_tokens[:-1]
+    for idx in range(len(name_tokens)):
+        if name_tokens[idx] != param_tokens[idx]:
+            return False
+    return True
 
 
 def get_all_pruned_weights(filter_indexes):
@@ -312,6 +318,7 @@ def get_filter_weigths(model, pruned_filter_indexes):
     Returns dict, which maps name of pruned filter to the actual weights of this filter
     """
     pruned_filter_weights = {}
+    pruned_filter_weights_test = {}
     kept_filter_weights = {}
     
     #The map {pruned filter name to filter weights} is created here
@@ -321,23 +328,23 @@ def get_filter_weigths(model, pruned_filter_indexes):
             if compare_layers(filter_name, n):
                 bitmap = pruned_filter_indexes[filter_name]
                 kept_bitmap = [~i for i in bitmap]
+                pruned_filter_weights_test[filter_name] = bitmap
                 pruned_filter_weights[n] = [p, bitmap]
                 kept_filter_weights[n] = [p, kept_bitmap]
+                found_pruned = True
+
+                if p.shape[0] != len(bitmap):
+                    print(n)
+                    print(filter_name)
         
         if not found_pruned:
             bitmap = [True for _ in p]
             kept_filter_weights[n] = [p, bitmap]
     
-    return pruned_filter_weights, kept_filter_weights
-
-def get_l2_reg(filter_weights, weights, config):
-    l2 = reduce((lambda x, y: x + filter_weights[y[0]][y[1]].norm(p=2)), 
-                         weights, torch.zeros(1).to(config.device))
-            
-    return l2
+    return pruned_filter_weights, kept_filter_weights, pruned_filter_weights_test
 
 def train_grow_reg(config, model, criterion, criterion_fn, optimizer, train_loader, 
-                    t_pick=1e-2, t_granularity=1e-5, K_u=10, K_st=5000):
+                    t_pick=1e-2, t_granularity=1e-3, K_u=5, K_st=40000):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -412,7 +419,7 @@ def train_grow_reg(config, model, criterion, criterion_fn, optimizer, train_load
 
 
 def train_step2(config, model, criterion, criterion_fn, optimizer, train_loader, 
-               pruned_filter_indexes, t_start=0, t_pick=0.1, t_granularity=1e-4, K_u=10):
+               pruned_filter_indexes, t_start=0, t_pick=1, t_granularity=1e-3, K_u=5):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -427,8 +434,12 @@ def train_step2(config, model, criterion, criterion_fn, optimizer, train_loader,
     l2_p_log = []
     l2_k_log = []
 
-    pruned_filter_weights, kept_filter_weights = get_filter_weigths(model, pruned_filter_indexes)
-        
+    pruned_filter_weights, kept_filter_weights, pt = get_filter_weigths(model, pruned_filter_indexes)
+
+    for w in pruned_filter_weights:
+        if pruned_filter_weights[w][0].shape[0] != len(pruned_filter_weights[w][1]):
+            print("Wrong filter matching: {}".format(w))
+
     while t <= t_pick:
         data_time.update(time.time() - end)
 
@@ -444,13 +455,17 @@ def train_step2(config, model, criterion, criterion_fn, optimizer, train_loader,
             
             l2_p_log.append(l2_p)
 
+            """
             l2_k = reduce((lambda x, y: x + kept_filter_weights[y][0][kept_filter_weights[y][1]].norm(p=2)), kept_filter_weights, 
                             torch.zeros(1).to(config.device))
 
             l2_k_log.append(l2_k)
-            print("Pruned L2: {}, Kept L2: {}".format(l2_p, l2_k))
+            """
+            
+            #print("Pruned L2: {}, Kept L2: {}".format(l2_p, l2_k))
+            print("Pruned L2: {}".format(l2_p))
 
-            loss = criterion_fn(output, target, criterion) + t*l2_p + l_neg*l2_k
+            loss = criterion_fn(output, target, criterion) + t*l2_p #+ l_neg*l2_k
 
             if isinstance(output, InceptionOutputs) or isinstance(output, GoogLeNetOutputs):
                 output = output.logits

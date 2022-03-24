@@ -1,8 +1,8 @@
 {
-    "model": "googlenet",
+    "model": "googlenet_cifar",
     "batch_size" : 128,
     "pretrained": true,
-    "epochs": 200,
+    "epochs": 120,
     "input_info": {
         "sample_size": [
             1,
@@ -13,13 +13,12 @@
     },
     "optimizer": {
         "type": "SGD",
-        "base_lr": 0.1,
+        "base_lr": 1e-2,
         "weight_decay": 5e-4,
         "schedule_type": "multistep",
         "steps": [
             60,
-            120,
-            160
+            90
         ],
         "optimizer_params":
         {
@@ -30,7 +29,10 @@
     "compression": [
        {
             "algorithm": "filter_pruning",
-            "pruning_init": 0.5
+            "pruning_init": 0.7,
+            "params": {
+                "pruning_target": 0.7
+            }
        }
     ]
 }
